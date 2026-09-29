@@ -170,4 +170,87 @@ describe('HistoryModule on a real store (PR #174 review)', () => {
     assert.equal((await call(mod, 'search', { query: 'cafe', wholeWord: true })).matches.length, 0);
     assert.equal((await call(mod, 'search', { query: 'नम', wholeWord: true })).matches.length, 0);
   });
+
 });
+
+describe('Greptile review on 62b57f0 (real store)', () => {
+  const ids = (d: any, key = 'messages') => d[key].map((m: any) => m.id);
+
+  it('G1: search limit continuation makes progress (distinct times and a same-ms group)', async () => {
+    const now = Date.now();
+    const rows: Row[] = [1, 2, 3].map((i) => ({ text: `x${i}`, channel: 'c', ms: now - (10 - i) * MIN }));
+    for (let i = 0; i < 5; i++) rows.push({ text: `x-tie${i}`, channel: 'c', ms: now - MIN });
+    const { mod } = build(rows);
+    for (const [order, extra] of [['oldest', { limit: 1 }], ['newest', { limit: 1 }], ['oldest', { maxScan: 2 }], ['newest', { maxScan: 2 }]] as const) {
+      const seen: string[] = [];
+      let d = await call(mod, 'search', { query: 'x', order, ...extra });
+      seen.push(...ids(d, 'matches'));
+      for (let guard = 0; (d.resume || d.scannedThrough) && guard < 12; guard++) {
+        const cont = d.resume ?? { [order === 'oldest' ? 'from' : 'to']: d.scannedThrough };
+        d = await call(mod, 'search', { query: 'x', order, ...extra, ...cont });
+        seen.push(...ids(d, 'matches'));
+      }
+      assert.equal(new Set(seen).size, 8, `${order} ${JSON.stringify(extra)}: reached ${new Set(seen).size}/8`);
+      assert.equal(seen.length, 8, `${order} ${JSON.stringify(extra)}: no repeats`);
+    }
+  });
+
+  it('G2: a resumed, exhausted author extract does not claim the whole-window matchedCount', async () => {
+    const now = Date.now();
+    const { mod } = build([1, 2, 3, 4].map((i) => ({ text: `a${i}`, channel: 'd', author: 'antra', ms: now - (10 - i) * MIN })));
+    const first = await call(mod, 'extract', { author: 'antra', channelId: 'd', maxScan: 3 });
+    const second = await call(mod, 'extract', { author: 'antra', channelId: 'd', maxScan: 3, ...first.resume });
+    assert.equal(second.truncated, false);
+    assert.equal(second.matchedCount, undefined, 'resumed scan saw only part of the window');
+    assert.equal(first.matchedCountAtLeast + second.matchedSinceWindowOffset, 4);
+  });
+
+  it('G3: aroundId rejects limit instead of silently ignoring it', async () => {
+    const { mod, ids: m } = build([{ text: 'a', channel: 'd', ms: Date.now() - MIN }]);
+    const r = await mod.handleToolCall({ id: 't', name: 'extract', input: { aroundId: m.get('a'), limit: 1 } } as ToolCall);
+    assert.equal(r.success, false);
+  });
+
+  it('G4: aroundId inside a same-millisecond group larger than the tie cap returns true neighbours', async () => {
+    const now = Date.now();
+    const rows: Row[] = [];
+    for (let i = 0; i < 1100; i++) rows.push({ text: `t${i}`, channel: 'd', ms: now - MIN });
+    const { mod, ids: m } = build(rows);
+    const d = await call(mod, 'extract', { aroundId: m.get('t590'), before: 3, after: 2 });
+    assert.deepEqual(ids(d), [587, 588, 589, 590, 591, 592].map((i) => m.get(`t${i}`)));
+  });
+
+  it('G5: <@id> mention form works for alphanumeric ids', async () => {
+    const { mod, ids: m } = build([{ text: 'hi', channel: 'z', ms: Date.now() - MIN, author: 'Ann', authorId: 'U0ABC' }]);
+    assert.deepEqual(ids(await call(mod, 'search', { query: 'hi', author: '<@U0ABC>' }), 'matches'), [m.get('hi')]);
+    assert.equal((await call(mod, 'search', { query: 'hi', excludeAuthor: '<@U0ABC>' })).matches.length, 0);
+  });
+
+  it('G6: wholeWord sees astral-plane letters beside the match', async () => {
+    const { mod } = build([{ text: '\u{1D504}a b\u{1D504}', channel: 'z', ms: Date.now() - MIN }]);
+    assert.equal((await call(mod, 'search', { query: 'a', wholeWord: true })).matches.length, 0);
+    assert.equal((await call(mod, 'search', { query: 'b', wholeWord: true })).matches.length, 0);
+  });
+
+  it('G7: author schema does not advertise a form its declared type rejects', () => {
+    const tools = new HistoryModule().getTools();
+    for (const t of tools) {
+      for (const k of ['author', 'excludeAuthor']) {
+        const p = (t.inputSchema as any).properties?.[k];
+        if (!p) continue;
+        const allowsString = p.type === 'string' || (Array.isArray(p.type) && p.type.includes('string'));
+        assert.ok(allowsString || !/single string/i.test(p.description), `${t.name}.${k}`);
+      }
+    }
+  });
+
+  it('G8: limit:0 author extract resume advances; maxScan:0 is rejected', async () => {
+    const now = Date.now();
+    const { mod } = build([1, 2, 3].map((i) => ({ text: `a${i}`, channel: 'd', author: 'antra', ms: now - (10 - i) * MIN })));
+    const d = await call(mod, 'extract', { author: 'antra', channelId: 'd', limit: 0 });
+    assert.ok(!d.truncated || d.resume.windowOffset > 0, JSON.stringify(d));
+    const r = await mod.handleToolCall({ id: 't', name: 'extract', input: { author: 'antra', maxScan: 0 } } as ToolCall);
+    assert.equal(r.success, false);
+  });
+});
+

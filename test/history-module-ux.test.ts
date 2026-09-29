@@ -152,7 +152,8 @@ describe('HistoryModule UX: author filter', () => {
     assert.equal(d.messages[0].author, 'antra');
     // page full + one more antra message (m7) exists → not a total
     assert.equal(d.truncated, true);
-    assert.equal(d.matchedCountAtLeast, 4);
+    // counted up to the resume point; the lookahead (m7) is re-scanned by the resume
+    assert.equal(d.matchedCountAtLeast, 3);
     const all = data(await call(mod, 'extract', { author: 'antra' }));
     assert.equal(all.truncated, false);
     assert.equal(all.matchedCount, 4);

@@ -6,7 +6,9 @@
   message id from `search` (its own channel by default, `allChannels` to
   interleave). `search` adds `wholeWord` (Unicode-aware) and
   `order: "newest"`, and when it stops early (at `limit` or `maxScan`) it
-  reports `scannedThrough` plus a hint naming the `from`/`to` to continue with.
+  reports `scannedThrough` and `resume: {from|to, skip}` to repeat the call
+  with (`skip` steps past messages at that exact instant already scanned).
   An author-filtered `extract` that stops early returns
   `resume: {windowOffset, offset}` to repeat the call with (position, not
-  timestamp, so late-appended backfill in a channel is not skipped).
+  timestamp, so late-appended backfill in a channel is not skipped); a
+  resumed call reports `matchedSinceWindowOffset` rather than a total.
