@@ -150,6 +150,10 @@ export class SemanticIndexClient {
     return this.call('POST', `/v1/index/${this.ns}/upsert`, { items });
   }
 
+  async delete(ids: string[]): Promise<{ deleted: number }> {
+    return this.call('POST', `/v1/index/${this.ns}/delete`, { ids });
+  }
+
   async search(req: SearchRequest): Promise<SearchResponse> {
     return this.call<SearchResponse>('POST', `/v1/index/${this.ns}/search`, req);
   }
@@ -164,16 +168,18 @@ export function messageIndexText(msg: StoredMessage, includePrivateTools = true)
     } else if (includePrivateTools && block.type === 'tool_use' && PRIVATE_PROSE_TOOLS.has(block.name)) {
       const input = (block as { input?: Record<string, unknown> }).input ?? {};
       for (const v of Object.values(input)) {
-        if (typeof v === 'string' && v.trim().length > 20) parts.push(`[${block.name}] ${v}`);
+        if (typeof v === 'string' && v.trim().length > 0) parts.push(`[${block.name}] ${v}`);
       }
     }
   }
   return parts.join('\n').trim();
 }
 
+/** Same two metadata shapes HistoryModule's getChannelId reads: MCPL ingestion writes `metadata.channelId`, older paths `metadata.external.channelId`. */
 function channelOf(msg: StoredMessage): string | null {
-  const ext = (msg.metadata as { external?: { channelId?: unknown } } | undefined)?.external;
-  return typeof ext?.channelId === 'string' ? ext.channelId : null;
+  const md = msg.metadata as { channelId?: unknown; external?: { channelId?: unknown } } | undefined;
+  if (typeof md?.channelId === 'string') return md.channelId;
+  return typeof md?.external?.channelId === 'string' ? md.external.channelId : null;
 }
 
 function authorOf(msg: StoredMessage): string | null {
@@ -249,6 +255,32 @@ export class SemanticIndexer {
     private readonly log: (msg: string) => void = () => {},
   ) {}
 
+  /**
+   * Edits and removals since the last successful sync. The time-cursor walk
+   * only revisits the overlap window, so an edit to an older message (its
+   * timestamp does not change) or a removal would otherwise never reach the
+   * index. In memory only: events that land while the module is detached or
+   * before a restart are not replayed (removals are still hidden at search
+   * time by the current-branch check in HistoryModule).
+   */
+  private readonly editedIds = new Set<string>();
+  private readonly removedIds = new Set<string>();
+  private detach: (() => void) | null = null;
+
+  /** Subscribe to message-store edits/removals. Idempotent; a CM without onMessage is tolerated. */
+  attach(): void {
+    if (this.detach) return;
+    const on = (this.cm as { onMessage?: ContextManager['onMessage'] }).onMessage;
+    if (typeof on !== 'function') return;
+    this.detach = on.call(this.cm, (e) => {
+      if (e.type === 'edit') { this.editedIds.add(String(e.messageId)); }
+      else if (e.type === 'remove') { const id = String(e.messageId); this.editedIds.delete(id); this.removedIds.add(id); }
+      // removeRange carries only its endpoints; removed ids in it are hidden at search time instead.
+    });
+  }
+
+  dispose(): void { this.detach?.(); this.detach = null; }
+
   get backingOff(): boolean { return Date.now() < this.backoffUntil; }
 
   /**
@@ -279,12 +311,59 @@ export class SemanticIndexer {
         pending = [];
       };
 
+      // Edits and removals first: they never come back round in the time walk.
+      if (this.removedIds.size > 0 || this.editedIds.size > 0) {
+        const removed = [...this.removedIds];
+        const edited = [...this.editedIds];
+        this.removedIds.clear(); this.editedIds.clear();
+        try {
+          const toDelete = removed.map((id) => `msg:${id}`);
+          const toUpsert: IndexItem[] = [];
+          for (const id of edited) {
+            const m = this.cm.getMessage(id as never);
+            const item = m ? messageToItem(m, this.cfg) : null;
+            if (item) toUpsert.push(item); else toDelete.push(`msg:${id}`);
+          }
+          if (toDelete.length > 0) await this.client.delete(toDelete);
+          for (let i = 0; i < toUpsert.length; i += batchSize) {
+            const chunk = toUpsert.slice(i, i + batchSize);
+            const r = await this.client.upsert(chunk);
+            report.pushed += chunk.length; report.inserted += r.inserted; report.updated += r.updated; report.unchanged += r.unchanged;
+          }
+        } catch (e) {
+          for (const id of removed) this.removedIds.add(id);
+          for (const id of edited) if (!this.removedIds.has(id)) this.editedIds.add(id);
+          throw e;
+        }
+      }
+
+      // Summaries before messages: they are few, and a message backlog that
+      // exceeds every tick's budget must not keep new summaries out forever.
+      {
+        const all = this.cm.getSummariesInRange({ fromMs: 0, toMs: Number.MAX_SAFE_INTEGER }) as SummaryLike[];
+        report.summariesScanned = all.length;
+        const fresh = all.filter((s) => sumWm === null || s.createdMs > sumWm).sort((a, b) => a.createdMs - b.createdMs);
+        for (const s of fresh) {
+          if (budget <= 0) { report.more = true; break; }
+          const item = summaryToItem(s, this.cfg);
+          if (!item) continue;
+          pending.push(item); budget--;
+          if (pending.length >= batchSize) await flush();
+        }
+        await flush();
+      }
+
       // Messages: walk forward from (watermark - overlap) via the time index.
       let fromMs = msgWm === null ? undefined : Math.max(0, msgWm - (this.cfg.overlapMs ?? 600_000));
+      // Messages at exactly `fromMs` already seen this pass. The query bounds
+      // are inclusive, so the next page starts at the last page's final
+      // millisecond and skips the ones already walked with `offset` — a run
+      // of more than a page within one millisecond is walked, not jumped.
+      let offset = 0;
       const pageSize = 256;
       for (;;) {
         if (budget <= 0) { report.more = true; break; }
-        const page = this.cm.queryMessagesByTime({ fromMs, limit: pageSize });
+        const page = this.cm.queryMessagesByTime({ fromMs, offset, limit: pageSize });
         const msgs = page.messages;
         report.messagesScanned += msgs.length;
         for (const m of msgs) {
@@ -302,25 +381,11 @@ export class SemanticIndexer {
         }
         if (msgs.length < pageSize) break;
         const lastMs = msgs[msgs.length - 1]!.timestamp.getTime();
-        // Advance strictly: if a whole page shares one millisecond we would spin — step past it.
-        fromMs = lastMs === fromMs ? lastMs + 1 : lastMs;
+        const atLast = msgs.filter((m) => m.timestamp.getTime() === lastMs).length;
+        offset = lastMs === fromMs ? offset + atLast : atLast;
+        fromMs = lastMs;
       }
       await flush();
-
-      // Summaries: everything created after the summary watermark, any level.
-      if (!report.more) {
-        const all = this.cm.getSummariesInRange({ fromMs: 0, toMs: Number.MAX_SAFE_INTEGER }) as SummaryLike[];
-        report.summariesScanned = all.length;
-        const fresh = all.filter((s) => sumWm === null || s.createdMs > sumWm).sort((a, b) => a.createdMs - b.createdMs);
-        for (const s of fresh) {
-          if (budget <= 0) { report.more = true; break; }
-          const item = summaryToItem(s, this.cfg);
-          if (!item) continue;
-          pending.push(item); budget--;
-          if (pending.length >= batchSize) await flush();
-        }
-        await flush();
-      }
       this.consecutiveFailures = 0; this.lastError = null; this.lastSyncAt = Date.now();
       return report;
     } catch (e) {

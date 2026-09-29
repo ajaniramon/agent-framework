@@ -212,7 +212,9 @@ export class HistoryModule implements Module {
     this.cm = contextManager;
     this.channelRegistry = channelRegistry ?? null;
     if (this.semanticCfg && this.semanticClient) {
+      this.indexer?.dispose();
       this.indexer = new SemanticIndexer(contextManager, this.semanticClient, this.semanticCfg, (m) => console.warn(m));
+      this.indexer.attach();
       this.startSyncTimer();
     }
   }
@@ -295,6 +297,7 @@ export class HistoryModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+    this.indexer?.attach();
     this.startSyncTimer();
   }
 
@@ -302,6 +305,7 @@ export class HistoryModule implements Module {
     this.ctx = null;
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
     if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
+    this.indexer?.dispose();
   }
 
   /**
