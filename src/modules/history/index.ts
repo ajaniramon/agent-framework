@@ -75,6 +75,8 @@ interface ExtractInput {
   maxScan?: number;
   /** Resume point of an author-filtered scan (from a previous `resume`). */
   windowOffset?: number;
+  /** Id of the message just before `windowOffset` (from a previous `resume`). */
+  afterId?: string | null;
   aroundId?: string;
   before?: number;
   after?: number;
@@ -92,8 +94,11 @@ interface SearchInput {
   author?: AuthorSpec;
   excludeAuthor?: AuthorSpec;
   order?: 'oldest' | 'newest';
-  /** Pool messages to skip at the start of the window (from a previous `resume`). */
-  skip?: number;
+  /** Continuation only (from a previous `resume`): messages at exactly the
+   *  resume bound's millisecond whose sequence lies in [lo, hi] were already
+   *  scanned. A range, not a count, so a message added or removed at that
+   *  millisecond between calls can't shift what gets skipped. */
+  skipSequences?: [number, number];
   limit?: number;
   maxScan?: number;
 }
@@ -135,6 +140,9 @@ const NATIVE_OFFSET_MAX = 0xffffffff; // 4294967295
  */
 const EXTRACT_FILTER_DEFAULT_MAX_SCAN = 10000;
 const EXTRACT_FILTER_MAX_MAX_SCAN = 50000;
+/** How far (in window positions) a filtered-extract resume looks for its
+ *  `afterId` when the window moved since the previous call. */
+const RELOCATE_RADIUS = 1000;
 /** Native page size for the in-process filtered scans above. */
 const FILTER_SCAN_PAGE = 1000;
 
@@ -320,6 +328,66 @@ export class HistoryModule implements Module {
     return cm.queryMessagesByTime({ fromMs: ms, toMs: ms }).messages;
   }
 
+  /** Messages at exactly `ms` (in `channelId` when given). Bounded by
+   *  AROUND_TIE_CAP: past it a same-millisecond group is too large to step
+   *  through by sequence, and the caller should narrow instead. */
+  private countAtMs(ms: number, channelId: string | undefined): number {
+    const cm = this.cm as ContextManager;
+    const n =
+      channelId !== undefined
+        ? cm.queryMessagesByTimeAndChannel({ fromMs: ms, toMs: ms, channelId, limit: 0 }).matchedCount
+        : cm.queryMessagesByTime({ fromMs: ms, toMs: ms, limit: AROUND_TIE_CAP + 1 }).messages.length;
+    if (n > AROUND_TIE_CAP) {
+      throw new Error(
+        `More than ${AROUND_TIE_CAP} messages share the instant ${new Date(ms).toISOString()}; a continuation can't step ` +
+          'through them. Narrow the search with channelId/author instead.',
+      );
+    }
+    return n;
+  }
+
+  /**
+   * Validate a filtered-extract resume position against the window as it is
+   * NOW. `afterId` names the message the previous call saw at position
+   * `windowOffset - 1`. If it is still there, resume as asked. If the window
+   * moved (a removal or an insertion before that point since the previous
+   * call), look for it within RELOCATE_RADIUS positions either side and
+   * resume just past it, reporting the shift. If it can't be found — it was
+   * itself removed, or the window moved further than that — fail loudly:
+   * guessing is how a message gets silently skipped.
+   */
+  private relocateWindowOffset(
+    windowOffset: number,
+    afterId: string | null | undefined,
+    q: { fromMs?: number; toMs?: number; channelId?: string },
+  ): { windowOffset: number; shift: number } {
+    if (windowOffset === 0) {
+      if (afterId != null) throw new Error('"afterId" only applies together with a windowOffset > 0.');
+      return { windowOffset, shift: 0 };
+    }
+    if (afterId == null) {
+      throw new Error(
+        '"windowOffset" needs the "afterId" from the same `resume` object — without it a message added or removed ' +
+          'since the previous call would be silently skipped. Pass the whole `resume` object back.',
+      );
+    }
+    const cm = this.cm as ContextManager;
+    const at = cm.queryMessagesByTimeAndChannel({ ...q, limit: 1, offset: windowOffset - 1 }).messages[0];
+    if (at && String(at.id) === afterId) return { windowOffset, shift: 0 };
+    const lo = Math.max(0, windowOffset - 1 - RELOCATE_RADIUS);
+    const around = cm.queryMessagesByTimeAndChannel({ ...q, limit: 2 * RELOCATE_RADIUS + 1, offset: lo }).messages;
+    const i = around.findIndex((m) => String(m.id) === afterId);
+    if (i === -1) {
+      throw new Error(
+        `The window changed since the previous call: message ${afterId}, where that scan stopped, is no longer ` +
+          `within ${RELOCATE_RADIUS} positions of windowOffset ${windowOffset} (it may have been deleted). ` +
+          'Restart the scan without windowOffset/afterId, or narrow it with from/to.',
+      );
+    }
+    const relocated = lo + i + 1;
+    return { windowOffset: relocated, shift: relocated - windowOffset };
+  }
+
   /**
    * The `n` messages of a time/channel range nearest one of its edges, in
    * TIMESTAMP order walking away from that edge (newest-first for
@@ -466,8 +534,9 @@ export class HistoryModule implements Module {
           'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset/limit ' +
           'do not apply in this mode (at most before+after+1 messages). (2) author/excludeAuthor — keep only (or drop) messages by these ' +
           'authors; this is filtered in-process over at most maxScan messages of the window, so a response ' +
-          'may report truncated:true with a `resume` object ({windowOffset, offset}) — repeat the call with those ' +
-          'fields added to continue exactly where it stopped.',
+          'may report truncated:true with a `resume` object ({windowOffset, offset, afterId}) — repeat the call with ' +
+          'those fields added to continue exactly where it stopped. If messages were added or removed in the window ' +
+          'meanwhile, the resume re-anchors on afterId and says so (windowChanged), or fails loudly when it can\'t.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -476,7 +545,7 @@ export class HistoryModule implements Module {
             channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
             author: AUTHOR_SCHEMA,
             excludeAuthor: EXCLUDE_AUTHOR_SCHEMA,
-            aroundId: { type: 'string', description: 'Message id to center on (as returned by search/extract). Returns the surrounding conversation instead of a range.' },
+            aroundId: { type: 'string', description: 'Message id to center on (as returned by search/extract; a "msg:<id>" hit id works too). Returns the surrounding conversation instead of a range.' },
             before: { type: 'number', description: `With aroundId: messages to include before the anchor (default ${AROUND_DEFAULT}, cap ${AROUND_MAX}).` },
             after: { type: 'number', description: `With aroundId: messages to include after the anchor (default ${AROUND_DEFAULT}, cap ${AROUND_MAX}).` },
             allChannels: { type: 'boolean', description: 'With aroundId: interleave every channel around the anchor\'s time instead of staying in its channel (default false).' },
@@ -484,6 +553,7 @@ export class HistoryModule implements Module {
             offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
             maxScan: { type: 'number', description: `With author/excludeAuthor: max window messages to examine (default ${EXTRACT_FILTER_DEFAULT_MAX_SCAN}, hard cap ${EXTRACT_FILTER_MAX_MAX_SCAN}).` },
             windowOffset: { type: 'number', description: 'With author/excludeAuthor: resume a truncated scan at this position of the window — copy it from the previous response\'s `resume`.' },
+            afterId: { type: 'string', description: 'With windowOffset: id of the last message the previous call scanned — copy it from `resume`. Lets a resume notice messages added or removed since, instead of silently skipping one.' },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
         },
@@ -496,7 +566,8 @@ export class HistoryModule implements Module {
           'to maxScan candidates — if the narrowed window is larger than maxScan, the response reports ' +
           'truncated:true up front rather than silently missing later matches; narrow the filter or raise ' +
           'maxScan and retry. When the scan stops early (truncated, or `limit` matches reached) the response ' +
-          'carries scannedThrough: pass it as `from` (order:"oldest") or `to` (order:"newest") to continue. ' +
+          'carries a `resume` object ({from|to, skipSequences}): repeat the call with its fields to continue ' +
+          '(scannedThrough is the same instant, for reading). ' +
           'order:"newest" scans the most recent maxScan messages of the window first — usually what you want ' +
           'for "when did this last come up". author/excludeAuthor narrow by who wrote the message; ' +
           'wholeWord:true stops "mission" from matching inside "uncommissioned". Each match carries an `id` ' +
@@ -518,7 +589,11 @@ export class HistoryModule implements Module {
             order: { type: 'string', enum: ['oldest', 'newest'], description: 'Scan and return oldest-first (default) or newest-first.' },
             limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}). Must be a non-negative integer.` },
             maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a non-negative integer.` },
-            skip: { type: 'number', description: 'Continuation only: messages at the start of the window already scanned by the previous call — copy it from that response\'s `resume`.' },
+            skipSequences: {
+              type: 'array',
+              items: { type: 'number' },
+              description: 'Continuation only: copy it from the previous response\'s `resume` together with its from/to. Marks the messages at exactly that instant that were already scanned.',
+            },
           },
           required: ['query'],
         },
@@ -667,8 +742,8 @@ export class HistoryModule implements Module {
     const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     const cm = this.cm as ContextManager;
-    if (!authorFilter && input.windowOffset !== undefined) {
-      throw new Error('"windowOffset" only applies together with author/excludeAuthor (it resumes a filtered scan). Use offset.');
+    if (!authorFilter && (input.windowOffset !== undefined || input.afterId !== undefined)) {
+      throw new Error('"windowOffset"/"afterId" only apply together with author/excludeAuthor (they resume a filtered scan). Use offset.');
     }
 
     if (authorFilter) {
@@ -684,12 +759,25 @@ export class HistoryModule implements Module {
       // timestamp seen" would skip them.
       const maxScan = clampCount(input.maxScan, EXTRACT_FILTER_DEFAULT_MAX_SCAN, EXTRACT_FILTER_MAX_MAX_SCAN, 'maxScan');
       if (maxScan === 0) throw new Error('"maxScan" must be at least 1 for an author-filtered extract.');
-      const windowOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset');
+      const requestedOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset');
+      // A position is only meaningful against the window it was taken in:
+      // a removal before it (every discord:delete, host hide, /undo) shifts
+      // later positions left, and a message inserted before it (a
+      // time-ordered window with backfill) shifts them right. Either would
+      // silently skip or repeat a message. afterId pins the position to the
+      // message that was there; relocate it if the window moved.
+      const { windowOffset, shift } = this.relocateWindowOffset(
+        requestedOffset,
+        input.afterId,
+        { fromMs, toMs, channelId },
+      );
       const page: StoredMessage[] = [];
       let kept = 0;
       let scanned = 0;
-      // Window position just past the last message put on the page.
+      let lastScanned: StoredMessage | undefined;
+      // Window position just past the last message put on the page, and that message.
       let afterPage = windowOffset;
+      let lastOnPage: StoredMessage | undefined;
       let exhausted = false;
       let pageFull = false;
       outer: for (;;) {
@@ -704,10 +792,12 @@ export class HistoryModule implements Module {
         }).messages;
         for (const m of chunk) {
           scanned++;
+          lastScanned = m;
           if (!authorFilter(m)) continue;
           if (kept >= offset && page.length < limit) {
             page.push(m);
             afterPage = windowOffset + scanned;
+            lastOnPage = m;
           }
           kept++;
           if (limit > 0 && page.length >= limit && kept > offset + limit) {
@@ -748,14 +838,32 @@ export class HistoryModule implements Module {
           returned: page.length,
           scanned,
           truncated: !exhausted,
+          ...(shift !== 0
+            ? {
+                windowChanged: {
+                  shift,
+                  note:
+                    shift > 0
+                      ? `${shift} message(s) were added to the window before the resume point since the previous call; this scan chain did not see them.`
+                      : `${-shift} message(s) before the resume point were removed since the previous call; the resume was re-anchored, nothing skipped.`,
+                },
+              }
+            : {}),
           ...(!exhausted
             ? (() => {
                 // pageFull: resume just past the last returned message, no
                 // skip. maxScan: resume past everything scanned, still owing
                 // whatever part of `offset` was not yet consumed.
+                // afterId = the message at position windowOffset-1 (see
+                // relocateWindowOffset). When nothing was scanned (no
+                // chunk came back), carry the incoming anchor forward.
                 const resume = pageFull
-                  ? { windowOffset: afterPage, offset: 0 }
-                  : { windowOffset: windowOffset + scanned, offset: Math.max(0, offset - kept) };
+                  ? { windowOffset: afterPage, offset: 0, afterId: idOrNull(lastOnPage) ?? input.afterId ?? null }
+                  : {
+                      windowOffset: windowOffset + scanned,
+                      offset: Math.max(0, offset - kept),
+                      afterId: idOrNull(lastScanned) ?? input.afterId ?? null,
+                    };
                 return {
                   resume,
                   hint:
@@ -763,7 +871,7 @@ export class HistoryModule implements Module {
                       ? 'More matching messages exist. '
                       : `Stopped after scanning ${scanned} messages of the window without reaching its end. `) +
                     `Continue by repeating this call with the same from/to/channelId/author plus ` +
-                    `windowOffset:${resume.windowOffset} and offset:${resume.offset} (the fields of \`resume\`).`,
+                    `the fields of \`resume\` (windowOffset:${resume.windowOffset}, offset:${resume.offset}, afterId).`,
                 };
               })()
             : {}),
@@ -826,7 +934,15 @@ export class HistoryModule implements Module {
     const format = input.format ?? 'text';
     const cm = this.cm as ContextManager;
 
-    const anchor = cm.getMessage(String(input.aroundId));
+    // semantic_search (#173) hands out `msg:<id>` / `sum:<id>`; accept the
+    // message form as-is, and say plainly what a summary id is.
+    const rawId = String(input.aroundId);
+    if (/^sum:/.test(rawId)) {
+      throw new Error(
+        `${rawId} is a compression summary, not a message — use overview for summaries, or aroundId with a msg: hit.`,
+      );
+    }
+    const anchor = cm.getMessage(rawId.replace(/^msg:/, ''));
     if (!anchor) {
       throw new Error(`No message with id ${JSON.stringify(input.aroundId)} in this history.`);
     }
@@ -927,15 +1043,30 @@ export class HistoryModule implements Module {
     // detected up front rather than
     // silently scanning maxScan candidates and returning as if that were the
     // whole window. See the tool description's `truncated` contract.
-    const skip = clampCount(input.skip, 0, SEARCH_MAX_MAX_SCAN, 'skip');
+    if (maxScan === 0) throw new Error('"maxScan" must be at least 1 — a zero-message scan can never make progress.');
+    // Continuation: `skipSequences` names what the previous call already
+    // scanned at exactly the resume bound's millisecond (the bound is
+    // inclusive). Identified by sequence range rather than a count, so a
+    // message removed at that millisecond, or appended there (a new
+    // message always gets the highest sequence), between calls neither
+    // shifts the skip onto an unscanned message nor hides the new one.
+    const skipRange = parseSkipSequences(input.skipSequences);
+    const edgeMs = order === 'oldest' ? fromMs : toMs;
+    if (skipRange && edgeMs === undefined) {
+      throw new Error(`"skipSequences" only applies together with "${order === 'oldest' ? 'from' : 'to'}" — pass the whole \`resume\` object back.`);
+    }
+    const isSkipped = (m: StoredMessage) =>
+      !!skipRange && m.timestamp.getTime() === edgeMs && m.sequence >= skipRange[0] && m.sequence <= skipRange[1];
     let windowMessages: StoredMessage[];
-    let skippedPool: StoredMessage[];
     let truncated: boolean;
     {
-      const w = this.edgeWindow({ fromMs, toMs, channelId, n: maxScan + skip, side: order });
-      truncated = w.more;
-      skippedPool = w.messages.slice(0, skip);
-      windowMessages = w.messages.slice(skip);
+      // Over-fetch by the number of messages at the edge millisecond (the
+      // only ones that can be skipped), then drop the skipped ones.
+      const edgeTies = skipRange ? this.countAtMs(edgeMs!, channelId) : 0;
+      const w = this.edgeWindow({ fromMs, toMs, channelId, n: maxScan + edgeTies, side: order });
+      const pool = skipRange ? w.messages.filter((m) => !isSkipped(m)) : w.messages;
+      truncated = w.more || pool.length > maxScan;
+      windowMessages = pool.slice(0, maxScan);
     }
     const candidatePoolSize = windowMessages.length;
     const candidates = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
@@ -960,16 +1091,27 @@ export class HistoryModule implements Module {
       const at = last.timestamp.toISOString();
       const bound = order === 'oldest' ? 'from' : 'to';
       // The continuation bound is inclusive, so the next window starts with
-      // every message at exactly `at` — skip the ones already scanned (the
-      // pool is (timestamp, sequence) ordered from the edge, so those are a
-      // prefix of the next window). Without this a `limit` stop, or a
-      // maxScan stop inside a same-millisecond group, repeats forever.
-      const pool = [...skippedPool, ...windowMessages];
-      const stop = pool.indexOf(last);
+      // every message at exactly `at`. Hand back the sequence range already
+      // scanned there: this call's messages at `at` up to the stop, plus —
+      // when `at` is still the incoming bound — the range the previous
+      // call had already covered. Within one millisecond the pool is in
+      // sequence order, so every message at `at` whose sequence lies in the
+      // union was scanned; anything appended later sorts outside it.
       const atMs = last.timestamp.getTime();
-      let skipNext = 0;
-      for (let i = 0; i <= stop; i++) if (pool[i]!.timestamp.getTime() === atMs) skipNext++;
-      const resume = { [bound]: at, skip: skipNext };
+      const stop = windowMessages.indexOf(last);
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = 0; i <= stop; i++) {
+        const m = windowMessages[i]!;
+        if (m.timestamp.getTime() !== atMs) continue;
+        lo = Math.min(lo, m.sequence);
+        hi = Math.max(hi, m.sequence);
+      }
+      if (skipRange && atMs === edgeMs) {
+        lo = Math.min(lo, skipRange[0]);
+        hi = Math.max(hi, skipRange[1]);
+      }
+      const resume = { [bound]: at, skipSequences: [lo, hi] as [number, number] };
       return {
         scannedThrough: at,
         resume,
@@ -977,7 +1119,7 @@ export class HistoryModule implements Module {
           (stoppedEarly
             ? 'Stopped at limit; more candidates remain. '
             : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
-          `Continue by repeating the call with ${bound}:"${at}" and skip:${skipNext} (the fields of \`resume\`), ` +
+          `Continue by repeating the call with the fields of \`resume\` (${bound}:"${at}" and skipSequences), ` +
           'or raise limit/maxScan, or narrow with channelId/author/dates.',
       };
     };
@@ -1779,6 +1921,23 @@ function authorOf(msg: StoredMessage): { id?: string; name?: string } | undefine
     ...(typeof id === 'string' || typeof id === 'number' ? { id: String(id) } : {}),
     ...(typeof name === 'string' ? { name } : {}),
   };
+}
+
+function parseSkipSequences(v: unknown): [number, number] | null {
+  if (v === undefined || v === null) return null;
+  if (
+    !Array.isArray(v) ||
+    v.length !== 2 ||
+    !v.every((x) => typeof x === 'number' && Number.isInteger(x) && x >= 0) ||
+    v[0] > v[1]
+  ) {
+    throw new Error('"skipSequences" must be [lo, hi], two non-negative integers with lo <= hi — copy it from `resume`.');
+  }
+  return [v[0], v[1]];
+}
+
+function idOrNull(msg: StoredMessage | undefined): string | null {
+  return msg ? String(msg.id) : null;
 }
 
 function authorName(msg: StoredMessage): string | null {

@@ -39,14 +39,22 @@ function build(rows: Row[]) {
   } catch {}
   const ms = new MessageStore(store);
   const ids = new Map<string, string>();
-  rows.forEach((r, i) => {
+  // Live position of the next append: removals splice state items out.
+  let live = 0;
+  const append = (r: Row) => {
     const meta: Record<string, unknown> = { channelId: r.channel };
     if (r.author) meta.author = { id: r.authorId ?? `id-${r.author}`, name: r.author };
     const m = ms.append('user', [{ type: 'text', text: r.text }], meta as never);
     ids.set(r.text, String(m.id));
-    const item = store.getStateItemJson('messages', i) as Record<string, unknown>;
-    store.editStateItem('messages', i, Buffer.from(JSON.stringify({ ...item, timestamp: r.ms })));
-  });
+    const item = store.getStateItemJson('messages', live) as Record<string, unknown>;
+    store.editStateItem('messages', live, Buffer.from(JSON.stringify({ ...item, timestamp: r.ms })));
+    live++;
+  };
+  const remove = (text: string) => {
+    ms.remove(ids.get(text)! as never);
+    live--;
+  };
+  rows.forEach(append);
   const cm = {
     queryMessagesByTime: (o: never) => ms.queryByTime(o),
     queryMessagesByTimeAndChannel: (o: never) => ms.queryByTimeAndChannel(o),
@@ -54,7 +62,7 @@ function build(rows: Row[]) {
   } as unknown as ContextManager;
   const mod = new HistoryModule();
   mod.bind(cm);
-  return { mod, ids };
+  return { mod, ids, append, remove };
 }
 
 async function call(mod: HistoryModule, name: string, input: Record<string, unknown>): Promise<any> {
@@ -254,3 +262,106 @@ describe('Greptile review on 62b57f0 (real store)', () => {
   });
 });
 
+describe('HistoryModule on a real store: window changes between resume calls (PR #174 re-review)', () => {
+  const rowsN = (n: number, channel = 'd') => {
+    const now = Date.now();
+    return Array.from({ length: n }, (_, i) => ({ text: `m${i}`, channel, author: 'antra', ms: now - (100 - i) * MIN }));
+  };
+  const texts2 = (d: any) => d.messages.map((m: any) => String(m.content).replace(/^.*?:\s*/, ''));
+
+  for (const channelId of ['d', undefined]) {
+    it(`extract author resume after a removal before the cursor skips nothing (${channelId ? 'channel' : 'no channel'})`, async () => {
+      const { mod, remove } = build(rowsN(9));
+      const q = { author: 'antra', limit: 4, ...(channelId ? { channelId } : {}) };
+      const first = await call(mod, 'extract', q);
+      assert.deepEqual(texts2(first), ['m0', 'm1', 'm2', 'm3']);
+      remove('m1');
+      const second = await call(mod, 'extract', { ...q, ...first.resume });
+      assert.deepEqual(texts2(second), ['m4', 'm5', 'm6', 'm7']);
+      assert.equal(second.windowChanged?.shift, -1);
+    });
+  }
+
+  it('extract author resume after an older-stamped insertion before the cursor repeats nothing, and says so', async () => {
+    const { mod, append } = build(rowsN(9));
+    const first = await call(mod, 'extract', { author: 'antra', limit: 4 });
+    assert.deepEqual(texts2(first), ['m0', 'm1', 'm2', 'm3']);
+    // catch-up backfill: appended now, stamped between m0 and m1 → lands before the cursor in the time-ordered window
+    append({ text: 'late', channel: 'd', author: 'antra', ms: Date.now() - 99.5 * MIN });
+    const second = await call(mod, 'extract', { author: 'antra', limit: 4, ...first.resume });
+    assert.deepEqual(texts2(second), ['m4', 'm5', 'm6', 'm7']);
+    assert.equal(second.windowChanged?.shift, 1);
+    assert.match(second.windowChanged.note, /did not see/);
+  });
+
+  it('extract resume fails loudly when the anchor message itself was removed, or afterId is missing', async () => {
+    const { mod, remove } = build(rowsN(9));
+    const first = await call(mod, 'extract', { author: 'antra', channelId: 'd', limit: 4 });
+    remove('m3');
+    const r = await mod.handleToolCall({ id: 't', name: 'extract', input: { author: 'antra', channelId: 'd', limit: 4, ...first.resume } } as ToolCall);
+    assert.equal(r.success, false);
+    assert.match(r.error!, /window changed/);
+    const noId = await mod.handleToolCall({ id: 't', name: 'extract', input: { author: 'antra', channelId: 'd', windowOffset: 4 } } as ToolCall);
+    assert.equal(noId.success, false);
+    assert.match(noId.error!, /afterId/);
+  });
+
+  const chain = async (mod: HistoryModule, base: Record<string, unknown>, between?: (step: number) => void) => {
+    const seen: string[] = [];
+    let d = await call(mod, 'search', base);
+    seen.push(...d.matches.map((m: any) => m.id));
+    for (let step = 0; d.resume && step < 20; step++) {
+      between?.(step);
+      d = await call(mod, 'search', { ...base, ...d.resume });
+      seen.push(...d.matches.map((m: any) => m.id));
+    }
+    return seen;
+  };
+
+  for (const channelId of ['c', undefined]) {
+    it(`search newest: a message appended at the resume instant between calls is not lost (${channelId ? 'channel' : 'no channel'})`, async () => {
+      const now = Date.now();
+      const tieMs = now - MIN;
+      const rows: Row[] = [1, 2].map((i) => ({ text: `x-old${i}`, channel: 'c', ms: now - (10 - i) * MIN }));
+      for (let i = 0; i < 6; i++) rows.push({ text: `x-tie${i}`, channel: 'c', ms: tieMs });
+      const { mod, append, ids: m } = build(rows);
+      const base = { query: 'x', order: 'newest', limit: 3, ...(channelId ? { channelId } : {}) };
+      const seen = await chain(mod, base, (step) => {
+        if (step === 0) append({ text: 'x-tie-new', channel: 'c', ms: tieMs });
+      });
+      assert.ok(seen.includes(m.get('x-tie-new')!), 'appended tie reached');
+      assert.equal(new Set(seen).size, 9);
+      assert.equal(seen.length, 9, 'no repeats');
+    });
+  }
+
+  it('search oldest: removing an already-scanned message at the resume instant does not skip an unscanned one', async () => {
+    const now = Date.now();
+    const tieMs = now - MIN;
+    const rows: Row[] = [];
+    for (let i = 0; i < 6; i++) rows.push({ text: `x-tie${i}`, channel: 'c', ms: tieMs });
+    rows.push({ text: 'x-after', channel: 'c', ms: now - 0.5 * MIN });
+    const { mod, remove, ids: m } = build(rows);
+    const seen = await chain(mod, { query: 'x', limit: 2 }, (step) => {
+      if (step === 0) remove('x-tie0');
+    });
+    const expected = ['x-tie0', 'x-tie1', 'x-tie2', 'x-tie3', 'x-tie4', 'x-tie5', 'x-after'].map((t) => m.get(t));
+    assert.deepEqual(seen, expected);
+  });
+
+  it('search rejects maxScan:0 (it could never make progress)', async () => {
+    const { mod } = build(rowsN(2));
+    const r = await mod.handleToolCall({ id: 't', name: 'search', input: { query: 'm', maxScan: 0 } } as ToolCall);
+    assert.equal(r.success, false);
+    assert.match(r.error!, /maxScan/);
+  });
+
+  it('aroundId accepts a semantic_search "msg:<id>" hit and explains a "sum:<id>" one', async () => {
+    const { mod, ids: m } = build(rowsN(5));
+    const d = await call(mod, 'extract', { aroundId: `msg:${m.get('m2')}`, before: 1, after: 1 });
+    assert.deepEqual(texts2(d), ['m1', 'm2', 'm3']);
+    const r = await mod.handleToolCall({ id: 't', name: 'extract', input: { aroundId: 'sum:42' } } as ToolCall);
+    assert.equal(r.success, false);
+    assert.match(r.error!, /summary/);
+  });
+});
