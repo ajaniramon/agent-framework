@@ -3,4 +3,6 @@
   with its class and whether it came from an operator override, the
   server's own `_meta["mcpl/class"]`, or nowhere — unclassed), and the new
   `listToolClasses()` lists every tool the framework offers, host built-ins
-  included, with the same source and the MCPL server where there is one.
+  and agent-only tools (the subconscious's, `prose_help`) included, with
+  the same source and the MCPL server where there is one.
+  `listToolClasses(agentName)` lists exactly what that agent is shown.

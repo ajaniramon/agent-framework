@@ -14,6 +14,7 @@ function frameworkWithConnection(connection: Record<string, unknown>) {
     getServer: (id: string) => id === 'discord' ? connection : null,
   };
   framework.mcplTools = [{ name: 'mcpl--discord--send_message' }];
+  framework.mcplPrefixMap = new Map([['mcpl--discord', 'discord']]);
   return framework as AgentFramework;
 }
 
