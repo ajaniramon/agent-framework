@@ -49,6 +49,8 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     deniedCapabilities: ['contextHooks.beforeInference.inject.system'],
     allowHostCommands: true,
     toolObserveFilter: null,
+    // Unclassed here: the stub declares no class and no override.
+    toolClasses: [{ tool: 'mcpl--discord--send_message', serverTool: 'send_message', class: [], source: 'none' }],
     manifestState: {
       lastValidatedRevision: 'sha256:validated',
       lastFetchedAt: 1_786_000_000_000,

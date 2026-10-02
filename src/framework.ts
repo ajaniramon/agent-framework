@@ -68,7 +68,7 @@ import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './m
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
-import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type ToolClass } from './mcpl/tool-classes.js';
+import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
@@ -11568,19 +11568,36 @@ export class AgentFramework {
    */
   private describeToolForLifecycle(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string } {
     const mcpl = this.resolveMcplTool(tool);
-    if (mcpl) {
-      const [serverId, prefix] = mcpl;
-      const { classes } = resolveToolClass(tool, this.mcplToolClasses.get(tool), {
-        overrides: this.toolClassOverrides,
-        host: [],
-      });
-      return { class: classes, serverId, serverTool: tool.slice(prefix.length + 2) };
-    }
-    const { classes } = resolveToolClass(tool, undefined, {
-      overrides: this.toolClassOverrides,
-      host: this.hostToolClasses,
-    });
+    const { classes } = this.effectiveToolClass(tool, mcpl !== null);
+    if (mcpl) return { class: classes, serverId: mcpl[0], serverTool: tool.slice(mcpl[1].length + 2) };
     return { class: classes };
+  }
+
+  /**
+   * RFC-008 §5.1: a tool's effective class and the source that decided it.
+   * Operator overrides first; then host knowledge, for tools the host
+   * implements (never for MCPL tools); then an MCPL tool's own declaration.
+   * Tolerates partially-constructed frameworks (tests use Object.create).
+   */
+  private effectiveToolClass(tool: string, isMcpl: boolean): EffectiveToolClass {
+    return resolveToolClass(tool, isMcpl ? this.mcplToolClasses?.get(tool) : undefined, {
+      overrides: this.toolClassOverrides ?? [],
+      host: isMcpl ? [] : (this.hostToolClasses ?? []),
+    });
+  }
+
+  /**
+   * RFC-008 §6: every tool the framework offers, with its effective class
+   * and where that class came from (`override`, `host`, `server`, or `none`
+   * for an unclassed tool, which policy treats as most restrictive). For
+   * operators: a surprising class should be visible before it matters.
+   */
+  listToolClasses(): Array<{ tool: string; class: ToolClass[]; source: ToolClassSource; serverId?: string }> {
+    return this.getAllTools().map((t) => {
+      const mcpl = this.resolveMcplTool(t.name);
+      const { classes, source } = this.effectiveToolClass(t.name, mcpl !== null);
+      return { tool: t.name, class: classes, source, ...(mcpl ? { serverId: mcpl[0] } : {}) };
+    });
   }
 
   /**
@@ -13486,6 +13503,13 @@ export class AgentFramework {
      */
     toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
     /**
+     * RFC-008 §6: each of this server's tools with its effective class and
+     * the source that decided it — `override` (operator), `server` (its own
+     * `_meta["mcpl/class"]`), or `none` (unclassed: observers never see its
+     * arguments). Shown next to the grant so a surprising class is visible.
+     */
+    toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
+    /**
      * Per-transport §17 facts about the last manifest this host fetched and
      * acted on. The revision is server-authored and equality-only; these are
      * not the server's manifestChanged announcements.
@@ -13504,6 +13528,7 @@ export class AgentFramework {
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
       toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
+      toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
       manifestState: {
         lastValidatedRevision: string | null;
         lastFetchedAt: number | null;
@@ -13527,6 +13552,12 @@ export class AgentFramework {
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
         toolObserveFilter: connection?.toolObserveFilter ?? null,
+        toolClasses: (this.mcplTools ?? [])
+          .filter((t) => t.name.startsWith(`${prefix}--`))
+          .map((t) => {
+            const { classes, source } = this.effectiveToolClass(t.name, true);
+            return { tool: t.name, serverTool: t.name.slice(prefix.length + 2), class: classes, source };
+          }),
         manifestState: connection
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
