@@ -562,3 +562,31 @@ test('proseTargetFor: one whitespace-free token per channel that resolves back t
   }
   assert.equal(registry.proseTargetFor('discord:nowhere'), undefined, 'unregistered → undefined');
 });
+
+test('proseTargetFor: no token when none is safe (shared id across servers, whitespace-only options)', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  // The same channel id registered by two connections: a resolved target names a
+  // channel by id alone, so either server's reply could leave through the other.
+  await registry.handleChanged('discord-a', {
+    added: [{ id: 'chan:7', type: 'discord', label: '#shared-a', direction: 'bidirectional' }],
+  } as never);
+  await registry.handleChanged('discord-b', {
+    added: [{ id: 'chan:7', type: 'discord', label: '#shared-b', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.proseTargetFor('chan:7', 'discord-a'), undefined);
+  assert.equal(registry.proseTargetFor('chan:7', 'discord-b'), undefined);
+  assert.equal(registry.proseTargetFor('chan:7'), undefined);
+
+  // An id with whitespace and a label with whitespace: nothing parses as one target.
+  await registry.handleChanged('discord-a', {
+    added: [{ id: 'thread 42', type: 'discord', label: 'thread 42', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.proseTargetFor('thread 42', 'discord-a'), undefined);
+
+  // serverId is honoured: a channel registered only on discord-a isn't named for discord-b.
+  await registry.handleChanged('discord-a', {
+    added: [{ id: 'chan:8', type: 'discord', label: '#only-a', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
+  assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
+});

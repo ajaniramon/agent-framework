@@ -263,30 +263,46 @@ describe('Trunk channel routing (item-3 redux)', () => {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
-      proseTargetFor: (id: string) => { asked.push(id); return '@_reim0n'; },
+      proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
       stopAll: () => {},
     };
     i.handleMcplPushEvent(dmEvent('m3'));
     const text = textOf(framework);
-    assert.deepEqual(asked, ['discord:dm:1555']);
+    assert.deepEqual(asked, ['discord/discord:dm:1555'], 'asked for this channel on the server it came from');
     assert.match(text, /prefixed with ">>@_reim0n"/);
     assert.doesNotMatch(text, />>#DM:/);
     assert.match(text, /#DM: _reim0n/, 'the readable label still names the place');
     await framework.stop();
 
-    // Unknown to the registry: a label with whitespace falls back to the channel id, never verbatim.
+    // The registry finds no safe token (shared id, whitespace): no prefix is offered at all.
     const fw2 = await makeFramework();
     const i2 = internals(fw2);
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
-      getDescriptor: () => undefined,
+      getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       stopAll: () => {},
     };
     i2.handleMcplPushEvent(dmEvent('m4'));
-    assert.match(textOf(fw2), /prefixed with ">>discord:dm:1555"/);
+    const t2 = textOf(fw2);
+    assert.doesNotMatch(t2, /prefixed with ">>/);
+    assert.match(t2, /Reply without joining isn't available here/);
+    assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
+
+    // A registry stand-in without proseTargetFor: a whitespace-free guess, never the spaced label.
+    const fw3 = await makeFramework();
+    const i3 = internals(fw3);
+    i3.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => undefined,
+      stopAll: () => {},
+    };
+    i3.handleMcplPushEvent(dmEvent('m5'));
+    assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
+    await fw3.stop();
   });
 
   it('a channel-incoming trunk turn records its triggering channel', async () => {

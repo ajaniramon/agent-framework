@@ -2452,12 +2452,18 @@ export class ChannelRegistry {
    * a space can't be quoted verbatim: `>>#DM: alice` parses as target `#DM:`
    * plus body `alice …`, and `>>#fable (antra's server)` delivers
    * `(antra's server)` as text. Tried in order: `@name` for a DM, `#label`,
-   * `#name` (label without its server suffix), the descriptor id. Undefined
-   * when the channel isn't registered.
+   * `#name` (label without its server suffix), the descriptor id.
+   *
+   * Undefined when there is no safe token: the channel isn't registered (on
+   * `serverId`, when given), no candidate is whitespace-free and resolves back,
+   * or the id is registered by more than one server. A resolved target names a
+   * channel by id alone, and ids are unique only within a connection, so a
+   * shared id could route the reply through the wrong server.
    */
-  proseTargetFor(channelId: string): string | undefined {
-    const entry = this.findChannelEntry(channelId);
-    if (!entry) return undefined;
+  proseTargetFor(channelId: string, serverId?: string): string | undefined {
+    const sameId = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    const entry = serverId ? sameId.find((e) => e.serverId === serverId) : sameId[0];
+    if (!entry || sameId.length > 1) return undefined;
     const d = entry.descriptor;
     const label = d.label ?? '';
     const meta = d.metadata as { channelType?: string; recipientName?: string } | undefined;
@@ -2474,7 +2480,7 @@ export class ChannelRegistry {
       const r = this.resolveProseTarget(c);
       if ('channelId' in r && r.channelId === d.id) return c;
     }
-    return d.id;
+    return undefined;
   }
 
   /**
