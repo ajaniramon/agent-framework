@@ -11,9 +11,15 @@ import type { ContentBlock } from '@animalabs/membrane';
 class ToolModule implements Module {
   readonly name = 'tools';
   calls: ToolCall[] = [];
-  async start(_ctx: ModuleContext) {}
-  async stop() {}
+  speeches: string[] = [];
+  private ctx: ModuleContext | null = null;
+  async start(ctx: ModuleContext) { this.ctx = ctx; ctx.registerSpeechHandler('*'); }
+  async stop() { this.ctx?.unregisterSpeechHandler(); this.ctx = null; }
   async onProcess() { return {}; }
+  async onAgentSpeech(_agent: string, content: ContentBlock[]) {
+    const text = content.filter((b): b is ContentBlock & { type: 'text'; text: string } => b.type === 'text').map((b) => b.text).join('\n');
+    if (text) this.speeches.push(text);
+  }
   getTools(): ToolDefinition[] { return [{ name: 'ping', description: 'explicit action', inputSchema: { type: 'object', properties: {} } }]; }
   async handleToolCall(call: ToolCall): Promise<ToolResult> { this.calls.push(call); return { success: true, data: { ok: true } }; }
 }
@@ -37,12 +43,15 @@ async function make() {
     modules: [mod],
   });
   const routed: string[] = [];
+  const typing: string[] = [];
   (framework as any).channelRegistry = new Proxy({
     resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
     routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:commons' }; },
+    startTyping: (channel: string) => { typing.push(channel); },
+    stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,
   }, { get: (t, p: string) => p in t ? (t as any)[p] : () => undefined });
-  return { dir, membrane, mod, framework, routed };
+  return { dir, membrane, mod, framework, routed, typing };
 }
 
 describe('silent heartbeat', () => {
@@ -57,6 +66,8 @@ describe('silent heartbeat', () => {
       assert.equal(starts, 1, 'exactly one inference');
       assert.equal(pushRows, 0, 'no durable push message');
       assert.deepEqual(x.routed, [], 'no automatic prose delivery');
+      assert.deepEqual(x.mod.speeches, [], 'no module speech callback');
+      assert.deepEqual(x.typing, [], 'no typing indicator');
       const wire = JSON.stringify(x.membrane.calls[0]);
       assert.match(wire, /silent heartbeat/);
       assert.match(wire, /Scheduled private self-check/);
@@ -77,6 +88,21 @@ describe('silent heartbeat', () => {
       assert.equal(x.mod.calls.length, 1, 'explicit tool executed once');
       assert.equal(x.mod.calls[0]?.name, 'ping');
       assert.deepEqual(x.routed, [], 'no adjacent or trailing prose delivered');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+
+  it('does not silence a genuine request batched with the heartbeat', async () => {
+    const x = await make();
+    try {
+      x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'reply to human' }] as ContentBlock[]));
+      (x.framework as any).handleMcplPushEvent(silentEvent());
+      (x.framework as any).pendingRequests.push({
+        agentName: 'assistant', reason: 'channel-message', source: 'discord',
+        timestamp: Date.now() + 1, channelId: 'discord:g:c', addressed: true,
+      });
+      await x.framework.runUntilIdle();
+      assert.deepEqual(x.routed, ['reply to human'], 'ordinary addressed prose was delivered');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
