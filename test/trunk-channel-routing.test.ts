@@ -233,6 +233,62 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
+  it('the invitation\'s reply prefix is a single resolvable token, not a label with spaces', async () => {
+    // Live bug (2026-10-02): a first DM arrived on a closed channel labelled "DM: _reim0n"; the
+    // invitation said to prefix ">>#DM: _reim0n", which parses as target "#DM:" + body "_reim0n …":
+    // the reply bounced, and the retained text later went out with a stray "_reim0n" line.
+    const textOf = (framework: Awaited<ReturnType<typeof makeFramework>>) =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const dmEvent = (id: string) => ({
+      type: 'mcpl:push-event' as const,
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: `discord_msg_${id}`,
+      content: [{ type: 'text' as const, text: '_reim0n: hey, I have THE gossip' }],
+      origin: { source: 'discord', messageId: id, mcplChannelId: 'discord:dm:1555', channelName: 'DM: _reim0n' },
+      tags: ['chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: `i-${id}`,
+      triggerInference: false,
+    });
+
+    // The registry knows the channel: its round-trip target is used.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const asked: string[] = [];
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: (id: string) => { asked.push(id); return '@_reim0n'; },
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent(dmEvent('m3'));
+    const text = textOf(framework);
+    assert.deepEqual(asked, ['discord:dm:1555']);
+    assert.match(text, /prefixed with ">>@_reim0n"/);
+    assert.doesNotMatch(text, />>#DM:/);
+    assert.match(text, /#DM: _reim0n/, 'the readable label still names the place');
+    await framework.stop();
+
+    // Unknown to the registry: a label with whitespace falls back to the channel id, never verbatim.
+    const fw2 = await makeFramework();
+    const i2 = internals(fw2);
+    i2.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => undefined,
+      proseTargetFor: () => undefined,
+      stopAll: () => {},
+    };
+    i2.handleMcplPushEvent(dmEvent('m4'));
+    assert.match(textOf(fw2), /prefixed with ">>discord:dm:1555"/);
+    await fw2.stop();
+  });
+
   it('a channel-incoming trunk turn records its triggering channel', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the date is ...' }]));
     const framework = await makeFramework();

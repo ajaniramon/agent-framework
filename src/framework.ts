@@ -7323,6 +7323,11 @@ export class AgentFramework {
     const label = opts.channelLabel ?? descriptor?.label;
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    // The label is for reading; the prefix must be ONE token that resolves back
+    // here (a DM label "DM: alice" quoted verbatim parses as target "#DM:").
+    const target =
+      this.channelRegistry.proseTargetFor?.(opts.channelId) ??
+      (label && !/\s/.test(label) ? `#${label}` : opts.channelId);
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -7338,7 +7343,7 @@ export class AgentFramework {
         `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
         missedNote +
         `Your options:\n` +
-        `1. Reply without joining — write your reply this turn prefixed with ">>${channelLabel}"; it will be delivered there. ` +
+        `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
         `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n` +
         `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
         (maxBackscroll > 0

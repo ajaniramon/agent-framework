@@ -2446,6 +2446,38 @@ export class ChannelRegistry {
   }
 
   /**
+   * The `>>` target to show an agent for a channel: one whitespace-free token
+   * that `resolveProseTarget()` maps back to this same channel. The prefix
+   * grammar takes the target as the first non-whitespace run, so a label with
+   * a space can't be quoted verbatim: `>>#DM: alice` parses as target `#DM:`
+   * plus body `alice …`, and `>>#fable (antra's server)` delivers
+   * `(antra's server)` as text. Tried in order: `@name` for a DM, `#label`,
+   * `#name` (label without its server suffix), the descriptor id. Undefined
+   * when the channel isn't registered.
+   */
+  proseTargetFor(channelId: string): string | undefined {
+    const entry = this.findChannelEntry(channelId);
+    if (!entry) return undefined;
+    const d = entry.descriptor;
+    const label = d.label ?? '';
+    const meta = d.metadata as { channelType?: string; recipientName?: string } | undefined;
+    const isDm = meta?.channelType === 'dm' || label.toLowerCase().startsWith('dm: ') || d.id.includes(':dm:');
+    const dmName = meta?.recipientName ?? (label.toLowerCase().startsWith('dm: ') ? label.slice(4) : undefined);
+    const bare = label.replace(/^#/, '');
+    const candidates = [
+      ...(isDm && dmName ? [`@${dmName}`] : []),
+      ...(bare ? [`#${bare}`, `#${bare.replace(/\s*\([^)]*\)\s*$/, '')}`] : []),
+      d.id,
+    ];
+    for (const c of candidates) {
+      if (/\s/.test(c) || c === '#') continue;
+      const r = this.resolveProseTarget(c);
+      if ('channelId' in r && r.channelId === d.id) return c;
+    }
+    return d.id;
+  }
+
+  /**
    * Open a channel because something was DELIVERED into it (explicit send
    * tool or routed speech). Sending into a closed channel is not a thing:
    * engaging a channel opens it, so typing indicators, reaction machinery,
