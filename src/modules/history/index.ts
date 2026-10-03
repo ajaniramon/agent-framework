@@ -49,6 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
+import { SemanticIndexClient, SemanticIndexer, messageIndexText, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 
 // ============================================================================
 // Tool input shapes
@@ -111,6 +112,22 @@ interface OverviewInput {
   channelId?: string;
   level?: number;
   limit?: number;
+}
+
+interface SemanticSearchInput {
+  query: string;
+  limit?: number;
+  from?: string;
+  to?: string;
+  channelId?: string;
+  kinds?: 'messages' | 'summaries' | 'both';
+  level?: number;
+  minScore?: number;
+}
+
+export interface HistoryModuleOptions {
+  /** Enable `semantic_search` against a shared embed-service (see ./semantic.ts). Absent = tool not offered. */
+  semantic?: SemanticIndexConfig;
 }
 
 // ============================================================================
@@ -187,6 +204,16 @@ const SEARCH_MAX_MAX_SCAN = 50000;
 const OVERVIEW_DEFAULT_LIMIT = 50;
 const OVERVIEW_MAX_LIMIT = 200;
 
+const SEMANTIC_DEFAULT_LIMIT = 10;
+const SEMANTIC_MAX_LIMIT = 50;
+/** Largest k sent to the embed-service when over-fetching past dropped hits (its own cap is 200). */
+const SEMANTIC_MAX_FETCH = 200;
+/** Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text. */
+function snippetOf(text: string): string {
+  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${text.slice(0, SEMANTIC_SNIPPET_CHARS)}…`;
+}
+const SEMANTIC_SNIPPET_CHARS = 400;
+
 /**
  * A `<@id>`/`<@!id>` Discord-style mention — same shape `ChannelRegistry`
  * uses for its own DM mention-form matching. A string matching this can
@@ -239,6 +266,16 @@ export class HistoryModule implements Module {
   private ctx: ModuleContext | null = null;
   private cm: ContextManager | null = null;
   private channelRegistry: ChannelRegistry | null = null;
+  private readonly semanticCfg: SemanticIndexConfig | null;
+  private semanticClient: SemanticIndexClient | null = null;
+  private indexer: SemanticIndexer | null = null;
+  private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private firstSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(options: HistoryModuleOptions = {}) {
+    this.semanticCfg = options.semantic ?? null;
+    if (this.semanticCfg) this.semanticClient = new SemanticIndexClient(this.semanticCfg);
+  }
 
   /**
    * Wire the context-manager instance, and optionally the host's
@@ -256,6 +293,15 @@ export class HistoryModule implements Module {
   bind(contextManager: ContextManager, channelRegistry?: ChannelRegistry): void {
     this.cm = contextManager;
     this.channelRegistry = channelRegistry ?? null;
+    if (this.semanticCfg && this.semanticClient) {
+      this.indexer?.dispose();
+      this.indexer = new SemanticIndexer(contextManager, this.semanticClient, this.semanticCfg, (m) => console.warn(m));
+      // start() may already have run (framework start before host bind):
+      // wire persistence now, or pending changes are neither restored nor saved.
+      if (this.ctx) this.wireIndexer(this.ctx);
+      else this.indexer.attach();
+      this.startSyncTimer();
+    }
   }
 
   /**
@@ -539,10 +585,50 @@ export class HistoryModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+    this.wireIndexer(ctx);
+    this.startSyncTimer();
+  }
+
+  /** Pending edits/removals survive a restart through module state. Called from whichever of start()/bind() runs second. */
+  private wireIndexer(ctx: ModuleContext): void {
+    if (!this.indexer) return;
+    this.indexer.restorePending(ctx.getState<{ semanticPending?: PendingChanges }>()?.semanticPending);
+    this.indexer.onPendingChange = (p) => {
+      const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+      this.ctx?.setState({ ...prev, semanticPending: p });
+    };
+    this.indexer.attach();
   }
 
   async stop(): Promise<void> {
     this.ctx = null;
+    if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
+    if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
+    if (this.indexer) this.indexer.onPendingChange = null;
+    this.indexer?.dispose();
+  }
+
+  /**
+   * Background sync into the semantic index: every `syncIntervalMs` (default
+   * 60 s) push up to `maxSyncPerTick` new items. Idempotent to call — starts
+   * once we have both a context-manager (bind) and a config; `unref`'d so it
+   * never keeps a shutting-down process alive. A first tick runs after 5 s so
+   * a fresh store starts backfilling immediately rather than a minute later.
+   */
+  private startSyncTimer(): void {
+    if (this.syncTimer || !this.indexer || !this.semanticCfg) return;
+    const interval = this.semanticCfg.syncIntervalMs ?? 60_000;
+    if (interval <= 0) return;
+    const perTick = this.semanticCfg.maxSyncPerTick ?? 1024;
+    const tick = (): void => { void this.indexer?.catchUp(perTick); };
+    this.firstSyncTimer = setTimeout(() => { this.firstSyncTimer = null; tick(); }, 5_000);
+    this.firstSyncTimer.unref?.();
+    this.syncTimer = setInterval(tick, interval); this.syncTimer.unref?.();
+  }
+
+  /** Exposed for hosts/tests: one sync pass now. */
+  syncSemanticIndex(maxItems = 1024): Promise<SyncReport> | null {
+    return this.indexer ? this.indexer.catchUp(maxItems) : null;
   }
 
   getTools(): ToolDefinition[] {
@@ -686,7 +772,43 @@ export class HistoryModule implements Module {
           },
         },
       },
+      ...(this.semanticCfg ? [this.semanticSearchTool()] : []),
     ];
+  }
+
+  private semanticSearchTool(): ToolDefinition {
+    return {
+      name: 'semantic_search',
+      description:
+        'Search your own history by MEANING, not exact words: an embedding index over your raw messages ' +
+        '(text plus your own think/journal/skip_reply notes) and every compression summary. Use it when you ' +
+        'remember roughly what something was about but not the words — "the night the fluid sim was read ' +
+        'back to me as art" — then narrow with `from`/`to`/`channelId` and drill into the exact span with ' +
+        '`extract` or `overview` (for a message hit, `extract({ aroundId: messageId })` opens the conversation ' +
+        'around it — use the raw `messageId` field, not the `msg:` id). Results are ranked by cosine similarity (score ~0.6+ is a strong match, ' +
+        '~0.3 is thematic, below ~0.2 is noise); each hit carries its id (`msg:<id>` or `sum:<id>`), ' +
+        'timestamp, channel, kind/level and a snippet. The index catches up with recent messages before ' +
+        'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking; if a ' +
+        'background sync is already running, the search waits for that run to finish instead). ' +
+        'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
+        'before they come back: a message you undid or a summary from a branch you left is dropped and ' +
+        'counted in index.droppedOffBranch; a message edited down to nothing searchable is dropped and ' +
+        'counted in index.droppedStale. Message snippets always show the current text of the message.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          query: { type: 'string', description: 'What you are looking for, in natural language. A sentence works better than keywords.' },
+          limit: { type: 'number', description: `Max hits (default ${SEMANTIC_DEFAULT_LIMIT}, cap ${SEMANTIC_MAX_LIMIT}).` },
+          from: { type: 'string', description: 'ISO 8601 inclusive lower bound on the message timestamp / summary span start. Omit for open-ended.' },
+          to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
+          channelId: { type: 'string', description: 'Only raw messages from this channel (label like "#general" or the raw internal id). Summaries are not per-channel and are excluded when this is set; combining it with kinds="summaries" or level is an error.' },
+          kinds: { type: 'string', enum: ['messages', 'summaries', 'both'], description: 'What to search: raw messages, compression summaries, or both (default).' },
+          level: { type: 'number', description: 'Only summaries of this exact level (implies kinds=summaries).' },
+          minScore: { type: 'number', description: 'Drop hits below this cosine score (0..1). Default none.' },
+        },
+        required: ['query'],
+      },
+    };
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
@@ -703,6 +825,8 @@ export class HistoryModule implements Module {
           return await this.handleSearch((call.input ?? {}) as SearchInput);
         case 'overview':
           return this.handleOverview((call.input ?? {}) as OverviewInput);
+        case 'semantic_search':
+          return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
         default:
           return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
       }
@@ -1336,6 +1460,129 @@ export class HistoryModule implements Module {
   // ==========================================================================
   // overview
   // ==========================================================================
+
+  private async handleSemanticSearch(input: SemanticSearchInput): Promise<ToolResult> {
+    if (!this.semanticCfg || !this.semanticClient) {
+      throw new Error('semantic_search is not configured for this resident (no embed-service in the recipe).');
+    }
+    if (typeof input.query !== 'string' || !input.query.trim()) throw new Error('query must be a non-empty string');
+    const limit = clampCount(input.limit, SEMANTIC_DEFAULT_LIMIT, SEMANTIC_MAX_LIMIT, 'limit');
+    if (limit < 1) throw new Error('limit must be at least 1');
+    const fromMs = parseIsoDate(input.from, 'from');
+    const toMs = parseIsoDate(input.to, 'to');
+    if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) throw new Error('`from` must not be after `to`');
+    const channelId = this.resolveChannel(input.channelId);
+    // Summaries carry no channel, so a channel filter on a summaries-only
+    // search can only ever match nothing. Say so instead of returning [].
+    const wantsSummariesOnly = input.level !== undefined || input.kinds === 'summaries';
+    if (channelId && wantsSummariesOnly) {
+      throw new Error('channelId cannot be combined with kinds="summaries" or level: summaries are not per-channel. Drop channelId, or search kinds="messages".');
+    }
+    if (input.level !== undefined && input.kinds === 'messages') {
+      throw new Error('level applies to summaries only and cannot be combined with kinds="messages".');
+    }
+    let kinds: string[] | undefined;
+    if (wantsSummariesOnly) kinds = ['summary'];
+    else if (input.kinds === 'messages' || channelId) kinds = ['message'];
+    if (input.level !== undefined && (!Number.isInteger(input.level) || input.level < 0)) throw new Error('level must be a non-negative integer');
+    if (input.minScore !== undefined && (typeof input.minScore !== 'number' || input.minScore < -1 || input.minScore > 1)) {
+      throw new Error('minScore must be a number in -1..1');
+    }
+
+    // Bounded catch-up so the newest messages are searchable; never block on a backlog.
+    let sync: SyncReport | null = null;
+    if (this.indexer) {
+      try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
+    }
+
+    const runSearch = (k: number) => this.semanticClient!.search({
+      query: input.query, k,
+      ts_from: fromMs === undefined ? undefined : fromMs / 1000,
+      ts_to: toMs === undefined ? undefined : toMs / 1000,
+      channel: channelId, kinds, level: input.level, min_score: input.minScore, snippet: SEMANTIC_SNIPPET_CHARS,
+    });
+    // The remote index is append-only and knows nothing about branches: a
+    // message removed from the agent's reach by /undo, /checkout, /restore or
+    // /newtopic keeps its id (a new message gets a fresh one) and stays
+    // indexed. Check every hit against the CURRENT branch before it goes back
+    // to the model — getMessage/getSummary rebuild on branch switch, so an
+    // undone message or a summary minted on another branch answers null.
+    // k is small, so this is at most `limit` local lookups.
+    // A message hit whose current text has nothing left to index (edited
+    // blank, delete not yet applied) is dropped too, so its stale snippet is
+    // never served. Dropped hits are replaced by over-fetching: when the
+    // top k held droppable entries, re-query with a larger k (service cap
+    // 200) so lower-ranked on-branch matches still fill `limit`.
+    const cm = this.cm as ContextManager;
+    const includePrivate = this.semanticCfg.includePrivateTools ?? true;
+    // A message hit's snippet is rebuilt from the CURRENT local text, never
+    // the remote copy: an edit not yet synced (or one the index never got)
+    // must not leak a passage the edit removed. Only the ranking can be stale.
+    const currentText = new Map<string, string>();
+    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
+      const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
+      const sumId = /^sum:(.+)$/.exec(h.id)?.[1];
+      if (msgId !== undefined) {
+        const m = cm.getMessage(msgId);
+        if (!m) return 'offBranch';
+        const text = messageIndexText(m, includePrivate).slice(0, this.semanticCfg!.maxChars ?? 32_000);
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
+        return 'ok';
+      }
+      if (sumId !== undefined) return cm.getSummary(sumId) !== null ? 'ok' : 'offBranch';
+      return 'ok';
+    };
+    let k = limit;
+    let res = await runSearch(k);
+    let droppedOffBranch = 0;
+    let droppedStale = 0;
+    let onBranch: typeof res.hits = [];
+    for (;;) {
+      droppedOffBranch = 0; droppedStale = 0;
+      onBranch = res.hits.filter((h) => {
+        const v = keep(h);
+        if (v === 'offBranch') droppedOffBranch++;
+        else if (v === 'stale') droppedStale++;
+        return v === 'ok';
+      });
+      if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
+      k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
+      res = await runSearch(k);
+    }
+    onBranch = onBranch.slice(0, limit);
+    const hits = onBranch.map((h) => ({
+      id: h.id,
+      /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
+      messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
+      kind: h.kind,
+      level: h.level,
+      score: h.score,
+      timestamp: h.ts === null ? null : new Date(h.ts * 1000).toISOString(),
+      channelId: h.channel,
+      participant: (h.meta as { participant?: unknown }).participant ?? null,
+      author: (h.meta as { author?: unknown }).author ?? null,
+      snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
+      chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
+    }));
+    return {
+      success: true,
+      data: {
+        hits,
+        index: {
+          indexed: res.count_indexed,
+          behind: sync ? sync.more : this.indexer === null ? null : true,
+          syncedThisCall: sync ? sync.pushed : 0,
+          lastError: this.indexer?.lastError ?? null,
+          /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
+          droppedOffBranch,
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index delete is pending). */
+          droppedStale,
+        },
+        timingMs: res.timing_ms,
+      },
+    };
+  }
 
   private handleOverview(input: OverviewInput): ToolResult {
     const channelId = this.resolveChannel(input.channelId);
