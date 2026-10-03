@@ -7344,6 +7344,19 @@ export class AgentFramework {
     const label = opts.channelLabel ?? descriptor?.label;
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    // The label is for reading; the prefix must be ONE token that resolves back
+    // here, on this server (a DM label "DM: alice" quoted verbatim parses as
+    // target "#DM:"). A registry that can name targets is authoritative: no safe
+    // token means no prefix option. A stand-in without proseTargetFor gets a
+    // whitespace-free guess, never a label with spaces.
+    const namer = this.channelRegistry as { proseTargetFor?: (id: string, serverId?: string) => string | undefined };
+    const target = typeof namer.proseTargetFor === 'function'
+      ? namer.proseTargetFor(opts.channelId, opts.serverId)
+      : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
+    const replyOption = target
+      ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
+        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
+      : `1. Reply without joining isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -7359,8 +7372,7 @@ export class AgentFramework {
         `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
         missedNote +
         `Your options:\n` +
-        `1. Reply without joining — write your reply this turn prefixed with ">>${channelLabel}"; it will be delivered there. ` +
-        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n` +
+        replyOption +
         `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
         (maxBackscroll > 0
           ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
