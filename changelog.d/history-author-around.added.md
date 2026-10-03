@@ -17,6 +17,9 @@
   resume, `afterId` pins the position: if messages were removed or inserted
   before it since the previous call, the scan re-anchors and reports
   `windowChanged: {shift}`; if the anchor itself is gone, it fails loudly
-  instead of silently skipping. A resumed call reports
+  instead of silently skipping. Without a channel (a time-ordered window) the
+  resume also carries `seqMark`, and messages appended since then that landed
+  behind the cursor are reported in `windowChanged.missedIds` even when a
+  removal balanced them out (shift 0). A resumed call reports
   `matchedSinceWindowOffset` rather than a total.
   `aroundId` also accepts a `semantic_search` `msg:<id>` hit id.

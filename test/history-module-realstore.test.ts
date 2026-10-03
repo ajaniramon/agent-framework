@@ -59,6 +59,8 @@ function build(rows: Row[]) {
     queryMessagesByTime: (o: never) => ms.queryByTime(o),
     queryMessagesByTimeAndChannel: (o: never) => ms.queryByTimeAndChannel(o),
     getMessage: (id: string) => ms.get(id as never),
+    getMessageCount: () => ms.length(),
+    getMessageWindow: (offset: number, limit: number) => ms.getWindow(offset, limit),
   } as unknown as ContextManager;
   const mod = new HistoryModule();
   mod.bind(cm);
@@ -292,6 +294,28 @@ describe('HistoryModule on a real store: window changes between resume calls (PR
     assert.deepEqual(texts2(second), ['m4', 'm5', 'm6', 'm7']);
     assert.equal(second.windowChanged?.shift, 1);
     assert.match(second.windowChanged.note, /did not see/);
+  });
+
+  it('extract author resume notices a BALANCED change (one removal + one older-stamped insertion before the cursor)', async () => {
+    const { mod, append, remove, ids: m } = build(rowsN(9));
+    const first = await call(mod, 'extract', { author: 'antra', limit: 4 });
+    assert.deepEqual(texts2(first), ['m0', 'm1', 'm2', 'm3']);
+    remove('m1');
+    append({ text: 'late', channel: 'd', author: 'antra', ms: Date.now() - 99.5 * MIN });
+    const second = await call(mod, 'extract', { author: 'antra', limit: 4, ...first.resume });
+    assert.deepEqual(texts2(second), ['m4', 'm5', 'm6', 'm7']);
+    assert.ok(second.windowChanged, 'a message landed behind the cursor; the response must say so');
+    assert.deepEqual(second.windowChanged.missedIds, [m.get('late')]);
+  });
+
+  it('extract author resume in a channel window: a late append lands after the cursor and is simply returned', async () => {
+    const { mod, append, remove } = build(rowsN(9));
+    const q = { author: 'antra', limit: 4, channelId: 'd' };
+    const first = await call(mod, 'extract', q);
+    remove('m1');
+    append({ text: 'late', channel: 'd', author: 'antra', ms: Date.now() - 99.5 * MIN });
+    const second = await call(mod, 'extract', { ...q, limit: 10, ...first.resume });
+    assert.deepEqual(texts2(second), ['m4', 'm5', 'm6', 'm7', 'm8', 'late']);
   });
 
   it('extract resume fails loudly when the anchor message itself was removed, or afterId is missing', async () => {

@@ -77,6 +77,8 @@ interface ExtractInput {
   windowOffset?: number;
   /** Id of the message just before `windowOffset` (from a previous `resume`). */
   afterId?: string | null;
+  /** Time-ordered (no channelId) resume only: the store's highest sequence when the previous call ran. */
+  seqMark?: number;
   aroundId?: string;
   before?: number;
   after?: number;
@@ -346,6 +348,36 @@ export class HistoryModule implements Module {
     return n;
   }
 
+  /** Highest sequence in the store right now (the last append), or -1 when empty. */
+  private storeSeqMark(): number {
+    const cm = this.cm as ContextManager;
+    const count = cm.getMessageCount();
+    if (count === 0) return -1;
+    return cm.getMessageWindow(count - 1, 1).messages[0]?.sequence ?? -1;
+  }
+
+  /**
+   * Messages appended since `seqMark`, walking the store's append tail back
+   * until a sequence ≤ seqMark. Null when more than RELOCATE_RADIUS were
+   * appended — too many to check cheaply.
+   */
+  private appendedSince(seqMark: number): StoredMessage[] | null {
+    const cm = this.cm as ContextManager;
+    const out: StoredMessage[] = [];
+    let end = cm.getMessageCount();
+    while (end > 0) {
+      const start = Math.max(0, end - 100);
+      const w = cm.getMessageWindow(start, end - start).messages;
+      for (let i = w.length - 1; i >= 0; i--) {
+        if (w[i]!.sequence <= seqMark) return out;
+        out.push(w[i]!);
+        if (out.length > RELOCATE_RADIUS) return null;
+      }
+      end = start;
+    }
+    return out;
+  }
+
   /**
    * Validate a filtered-extract resume position against the window as it is
    * NOW. `afterId` names the message the previous call saw at position
@@ -553,6 +585,7 @@ export class HistoryModule implements Module {
             offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
             maxScan: { type: 'number', description: `With author/excludeAuthor: max window messages to examine (default ${EXTRACT_FILTER_DEFAULT_MAX_SCAN}, hard cap ${EXTRACT_FILTER_MAX_MAX_SCAN}).` },
             windowOffset: { type: 'number', description: 'With author/excludeAuthor: resume a truncated scan at this position of the window — copy it from the previous response\'s `resume`.' },
+            seqMark: { type: 'number', description: 'With windowOffset and no channelId: copy it from `resume`. Lets a resume find messages added behind it since the previous call.' },
             afterId: { type: 'string', description: 'With windowOffset: id of the last message the previous call scanned — copy it from `resume`. Lets a resume notice messages added or removed since, instead of silently skipping one.' },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
@@ -742,7 +775,7 @@ export class HistoryModule implements Module {
     const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     const cm = this.cm as ContextManager;
-    if (!authorFilter && (input.windowOffset !== undefined || input.afterId !== undefined)) {
+    if (!authorFilter && (input.windowOffset !== undefined || input.afterId !== undefined || input.seqMark !== undefined)) {
       throw new Error('"windowOffset"/"afterId" only apply together with author/excludeAuthor (they resume a filtered scan). Use offset.');
     }
 
@@ -771,6 +804,38 @@ export class HistoryModule implements Module {
         input.afterId,
         { fromMs, toMs, channelId },
       );
+      // A time-ordered window (no channelId) can also take an older-stamped
+      // insertion BEFORE the cursor; paired with a removal there, positions
+      // balance out (shift 0) and afterId alone can't see it. Appends carry
+      // the highest sequences, so everything appended since the previous
+      // call is the store's append tail above its seqMark: check those
+      // directly. (A channel window pages in append order, so an append
+      // always lands after the cursor and is simply scanned.)
+      const seqMarkNow = channelId === undefined ? this.storeSeqMark() : undefined;
+      let missed: StoredMessage[] = [];
+      if (channelId === undefined && windowOffset > 0) {
+        if (typeof input.seqMark !== 'number') {
+          throw new Error(
+            '"windowOffset" without channelId needs the "seqMark" from the same `resume` object. Pass the whole `resume` object back.',
+          );
+        }
+        const added = this.appendedSince(input.seqMark);
+        if (added === null) {
+          throw new Error(
+            `More than ${RELOCATE_RADIUS} messages were added since the previous call, too many to check against the ` +
+              'resume point. Restart the scan without windowOffset, or narrow it with from/to/channelId.',
+          );
+        }
+        const cursor = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, limit: 1, offset: windowOffset - 1 }).messages[0];
+        if (cursor) {
+          const ct = cursor.timestamp.getTime();
+          missed = added.filter((m) => {
+            const ts = m.timestamp.getTime();
+            if ((fromMs !== undefined && ts < fromMs) || (toMs !== undefined && ts > toMs)) return false;
+            return ts < ct || (ts === ct && m.sequence < cursor.sequence);
+          });
+        }
+      }
       const page: StoredMessage[] = [];
       let kept = 0;
       let scanned = 0;
@@ -838,13 +903,21 @@ export class HistoryModule implements Module {
           returned: page.length,
           scanned,
           truncated: !exhausted,
-          ...(shift !== 0
+          ...(shift !== 0 || missed.length > 0
             ? {
                 windowChanged: {
                   shift,
+                  ...(channelId === undefined
+                    ? {
+                        addedBefore: missed.length,
+                        // the ones this filter would have kept — fetch them with extract({aroundId})
+                        missedIds: missed.filter(authorFilter).map((m) => String(m.id)),
+                      }
+                    : {}),
                   note:
-                    shift > 0
-                      ? `${shift} message(s) were added to the window before the resume point since the previous call; this scan chain did not see them.`
+                    missed.length > 0 || shift > 0
+                      ? `${missed.length || shift} message(s) were added to the window before the resume point since the previous call; this scan chain did not see them` +
+                        (channelId === undefined ? ' (matching ones listed in missedIds).' : '.')
                       : `${-shift} message(s) before the resume point were removed since the previous call; the resume was re-anchored, nothing skipped.`,
                 },
               }
@@ -857,12 +930,14 @@ export class HistoryModule implements Module {
                 // afterId = the message at position windowOffset-1 (see
                 // relocateWindowOffset). When nothing was scanned (no
                 // chunk came back), carry the incoming anchor forward.
+                const mark = seqMarkNow !== undefined ? { seqMark: seqMarkNow } : {};
                 const resume = pageFull
-                  ? { windowOffset: afterPage, offset: 0, afterId: idOrNull(lastOnPage) ?? input.afterId ?? null }
+                  ? { windowOffset: afterPage, offset: 0, afterId: idOrNull(lastOnPage) ?? input.afterId ?? null, ...mark }
                   : {
                       windowOffset: windowOffset + scanned,
                       offset: Math.max(0, offset - kept),
                       afterId: idOrNull(lastScanned) ?? input.afterId ?? null,
+                      ...mark,
                     };
                 return {
                   resume,

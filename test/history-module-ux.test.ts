@@ -75,6 +75,8 @@ function stub(messages: StoredMessage[]) {
     getMessage(id: string): StoredMessage | null {
       return messages.find((m) => m.id === id) ?? null;
     },
+    getMessageCount: () => bySeq.length,
+    getMessageWindow: (offset: number, limit: number) => ({ messages: bySeq.slice(offset, offset + limit), startIndex: offset, totalCount: bySeq.length }),
   } as unknown as ContextManager;
   const mod = new HistoryModule();
   mod.bind(cm);
@@ -165,7 +167,7 @@ describe('HistoryModule UX: author filter', () => {
     const d = data(await call(mod, 'extract', { author: 'antra', maxScan: 3 }));
     assert.equal(d.truncated, true);
     assert.equal(d.scanned, 3);
-    assert.deepEqual(d.resume, { windowOffset: 3, offset: 0, afterId: 'm3' });
+    assert.deepEqual(d.resume, { windowOffset: 3, offset: 0, afterId: 'm3', seqMark: 7 });
     assert.deepEqual(d.messages.map((m: any) => m.id), ['m1']);
     const rest = data(await call(mod, 'extract', { author: 'antra', maxScan: 4, ...d.resume }));
     assert.deepEqual(rest.messages.map((m: any) => m.id), ['m4', 'm5', 'm7']);
