@@ -343,9 +343,16 @@ export class SemanticIndexer {
       let phaseError: string | null = null;
       if (this.removedIds.size > 0 || this.editedIds.size > 0) {
         const removed = [...this.removedIds];
-        const edited = [...this.editedIds];
-        this.removedIds.clear(); this.editedIds.clear();
+        // Edits spend the budget like any other upsert, so a large queue left
+        // by an outage cannot make a search's bounded catch-up unbounded; the
+        // rest stay queued for the next pass.
+        const edited = [...this.editedIds].slice(0, Math.max(0, budget));
+        budget -= edited.length;
+        this.removedIds.clear();
+        for (const id of edited) this.editedIds.delete(id);
+        if (this.editedIds.size > 0) report.more = true;
         const toDelete = removed.map((id) => `msg:${id}`);
+        const blanked: string[] = [];
         const toUpsert: IndexItem[] = [];
         for (const id of edited) {
           const m = this.cm.getMessage(id as never);
@@ -355,7 +362,7 @@ export class SemanticIndexer {
           if (!m) continue;
           const item = messageToItem(m, this.cfg);
           // On the branch but edited down to nothing indexable: delete.
-          if (item) toUpsert.push(item); else toDelete.push(`msg:${id}`);
+          if (item) toUpsert.push(item); else { toDelete.push(`msg:${id}`); blanked.push(id); }
         }
         if (toDelete.length > 0) {
           try {
@@ -364,12 +371,13 @@ export class SemanticIndexer {
             const msg = e instanceof Error ? e.message : String(e);
             if (/→ 404/.test(msg)) {
               // A service build without /delete (or a namespace that does
-              // not exist). Drop the removals: search-time branch checks
-              // already keep them out of results.
+              // not exist). Drop the removals and blanked edits: search-time
+              // checks (on-branch, still indexable) keep them out of results.
               this.deleteUnsupported = true;
               this.log(`[history/semantic] /delete unsupported by the embed-service; dropping ${toDelete.length} removal(s): ${msg}`);
             } else {
               for (const id of removed) this.removedIds.add(id);
+              for (const id of blanked) if (!this.removedIds.has(id)) this.editedIds.add(id);
               phaseError = msg;
               this.log(`[history/semantic] delete failed, ${removed.length} removal(s) re-queued: ${msg}`);
             }
@@ -395,12 +403,16 @@ export class SemanticIndexer {
       {
         const all = this.cm.getSummariesInRange({ fromMs: 0, toMs: Number.MAX_SAFE_INTEGER }) as SummaryLike[];
         report.summariesScanned = all.length;
-        const fresh = all.filter((s) => sumWm === null || s.createdMs > sumWm).sort((a, b) => a.createdMs - b.createdMs);
+        // `>=`: summaries sharing the watermark's millisecond may be only
+        // partly indexed (a bounded pass can stop inside a tie). Re-sending
+        // them is a dedup no-op for the service and costs no budget.
+        const fresh = all.filter((s) => sumWm === null || s.createdMs >= sumWm).sort((a, b) => a.createdMs - b.createdMs);
         for (const s of fresh) {
           if (budget <= 0) { report.more = true; break; }
           const item = summaryToItem(s, this.cfg);
           if (!item) continue;
-          pending.push(item); budget--;
+          pending.push(item);
+          if (sumWm === null || s.createdMs > sumWm) budget--;
           if (pending.length >= batchSize) await flush();
         }
         await flush();

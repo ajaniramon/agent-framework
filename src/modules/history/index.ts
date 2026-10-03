@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { SemanticIndexClient, SemanticIndexer, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { SemanticIndexClient, SemanticIndexer, messageIndexText, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 
 // ============================================================================
 // Tool input shapes
@@ -145,6 +145,8 @@ const OVERVIEW_MAX_LIMIT = 200;
 
 const SEMANTIC_DEFAULT_LIMIT = 10;
 const SEMANTIC_MAX_LIMIT = 50;
+/** Largest k sent to the embed-service when over-fetching past dropped hits (its own cap is 200). */
+const SEMANTIC_MAX_FETCH = 200;
 const SEMANTIC_SNIPPET_CHARS = 400;
 
 /**
@@ -214,7 +216,10 @@ export class HistoryModule implements Module {
     if (this.semanticCfg && this.semanticClient) {
       this.indexer?.dispose();
       this.indexer = new SemanticIndexer(contextManager, this.semanticClient, this.semanticCfg, (m) => console.warn(m));
-      this.indexer.attach();
+      // start() may already have run (framework start before host bind):
+      // wire persistence now, or pending changes are neither restored nor saved.
+      if (this.ctx) this.wireIndexer(this.ctx);
+      else this.indexer.attach();
       this.startSyncTimer();
     }
   }
@@ -297,16 +302,19 @@ export class HistoryModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
-    if (this.indexer) {
-      // Pending edits/removals survive a restart through module state.
-      this.indexer.restorePending(ctx.getState<{ semanticPending?: PendingChanges }>()?.semanticPending);
-      this.indexer.onPendingChange = (p) => {
-        const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
-        this.ctx?.setState({ ...prev, semanticPending: p });
-      };
-      this.indexer.attach();
-    }
+    this.wireIndexer(ctx);
     this.startSyncTimer();
+  }
+
+  /** Pending edits/removals survive a restart through module state. Called from whichever of start()/bind() runs second. */
+  private wireIndexer(ctx: ModuleContext): void {
+    if (!this.indexer) return;
+    this.indexer.restorePending(ctx.getState<{ semanticPending?: PendingChanges }>()?.semanticPending);
+    this.indexer.onPendingChange = (p) => {
+      const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+      this.ctx?.setState({ ...prev, semanticPending: p });
+    };
+    this.indexer.attach();
   }
 
   async stop(): Promise<void> {
@@ -794,8 +802,8 @@ export class HistoryModule implements Module {
       try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
     }
 
-    const res = await this.semanticClient.search({
-      query: input.query, k: limit,
+    const runSearch = (k: number) => this.semanticClient!.search({
+      query: input.query, k,
       ts_from: fromMs === undefined ? undefined : fromMs / 1000,
       ts_to: toMs === undefined ? undefined : toMs / 1000,
       channel: channelId, kinds, level: input.level, min_score: input.minScore, snippet: SEMANTIC_SNIPPET_CHARS,
@@ -807,17 +815,42 @@ export class HistoryModule implements Module {
     // to the model — getMessage/getSummary rebuild on branch switch, so an
     // undone message or a summary minted on another branch answers null.
     // k is small, so this is at most `limit` local lookups.
+    // A message hit whose current text has nothing left to index (edited
+    // blank, delete not yet applied) is dropped too, so its stale snippet is
+    // never served. Dropped hits are replaced by over-fetching: when the
+    // top k held droppable entries, re-query with a larger k (service cap
+    // 200) so lower-ranked on-branch matches still fill `limit`.
     const cm = this.cm as ContextManager;
-    let droppedOffBranch = 0;
-    const onBranch = res.hits.filter((h) => {
+    const includePrivate = this.semanticCfg.includePrivateTools ?? true;
+    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
       const sumId = /^sum:(.+)$/.exec(h.id)?.[1];
-      const present = msgId !== undefined ? cm.getMessage(msgId) !== null
-        : sumId !== undefined ? cm.getSummary(sumId) !== null
-        : true;
-      if (!present) droppedOffBranch++;
-      return present;
-    });
+      if (msgId !== undefined) {
+        const m = cm.getMessage(msgId);
+        if (!m) return 'offBranch';
+        return messageIndexText(m, includePrivate) ? 'ok' : 'stale';
+      }
+      if (sumId !== undefined) return cm.getSummary(sumId) !== null ? 'ok' : 'offBranch';
+      return 'ok';
+    };
+    let k = limit;
+    let res = await runSearch(k);
+    let droppedOffBranch = 0;
+    let droppedStale = 0;
+    let onBranch: typeof res.hits = [];
+    for (;;) {
+      droppedOffBranch = 0; droppedStale = 0;
+      onBranch = res.hits.filter((h) => {
+        const v = keep(h);
+        if (v === 'offBranch') droppedOffBranch++;
+        else if (v === 'stale') droppedStale++;
+        return v === 'ok';
+      });
+      if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
+      k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
+      res = await runSearch(k);
+    }
+    onBranch = onBranch.slice(0, limit);
     const hits = onBranch.map((h) => ({
       id: h.id,
       /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
@@ -843,6 +876,8 @@ export class HistoryModule implements Module {
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
           droppedOffBranch,
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index delete is pending). */
+          droppedStale,
         },
         timingMs: res.timing_ms,
       },

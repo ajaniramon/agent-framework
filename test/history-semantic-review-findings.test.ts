@@ -17,6 +17,7 @@ class FakeService {
   items = new Map<string, Item>();
   calls: string[] = [];
   deleted: string[] = [];
+  searchKs: number[] = [];
   /** When set, /delete answers this status instead of deleting. */
   deleteStatus: number | null = null;
   server!: Server;
@@ -53,7 +54,11 @@ class FakeService {
           this.deleted.push(...ids);
           return json(200, { deleted: n });
         }
-        return json(200, { namespace: 'n', hits: [], count_indexed: this.items.size, timing_ms: { embed: 0, search: 0 } });
+        // search: every item in insertion order (a stand-in ranking), first k, with text as snippet.
+        const q = JSON.parse(body) as { k: number };
+        this.searchKs.push(q.k);
+        const hits = [...this.items.values()].slice(0, q.k).map((it, i) => ({ id: it.id, score: 1 - i / 1000, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, text: it.text, chars: it.text.length, meta: {} }));
+        return json(200, { namespace: 'n', hits, count_indexed: this.items.size, timing_ms: { embed: 0, search: 0 } });
       });
     });
     await new Promise<void>((r) => this.server.listen(0, '127.0.0.1', r));
@@ -110,7 +115,7 @@ describe('semantic sync: Greptile #173 findings', () => {
   const svc = new FakeService();
   before(() => svc.start());
   after(() => svc.stop());
-  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; });
+  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; svc.searchKs.length = 0; });
 
   function mod(cm: StubCm): HistoryModule {
     const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
@@ -235,5 +240,79 @@ describe('semantic sync: Greptile #173 findings', () => {
     await m2.syncSemanticIndex();
     assert.equal(svc.items.get('msg:p')?.text, 'the corrected wording');
     await m2.stop();
+  });
+
+  // ---- Greptile re-review at 1b42164 ----
+
+  it('G2#1 pending changes are restored and persisted when start() runs before bind()', async () => {
+    const cm = new StubCm([msg('p', T0, 'the corrected wording'), msg('q', T0 + 3_600_000, 'an hour later')]);
+    let state: unknown = { semanticPending: { edited: ['p'], removed: [] } };
+    const ctx = { getState: () => state, setState: (v: unknown) => { state = v; } } as never;
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
+    await m.start(ctx);
+    m.bind(cm as unknown as ContextManager);
+    svc.items.set('msg:p', { id: 'msg:p', text: 'the original wording', kind: 'message', cursor: T0 });
+    svc.items.set('msg:q', { id: 'msg:q', text: 'an hour later', kind: 'message', cursor: T0 + 3_600_000 });
+    await m.syncSemanticIndex();
+    assert.equal(svc.items.get('msg:p')?.text, 'the corrected wording', 'pending edit restored from module state');
+    cm.edit('q', 'an hour later, edited');
+    assert.deepEqual((state as { semanticPending: { edited: string[] } }).semanticPending.edited, ['q'], 'new edits persisted');
+    await m.stop();
+  });
+
+  it('G2#2 summaries sharing one createdMs are all indexed across bounded passes', async () => {
+    const sums = [1, 2, 3].map((i) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T0, endMs: T0 + 1, firstSequence: 0, lastSequence: 1, createdMs: T0 + 5 }));
+    const m = mod(new StubCm([], sums));
+    for (let i = 0; i < 5; i++) await m.syncSemanticIndex(1);
+    assert.deepEqual([...svc.items.keys()].sort(), ['sum:s1', 'sum:s2', 'sum:s3']);
+    await m.stop();
+  });
+
+  it('G2#3 off-branch hits are replaced by lower-ranked on-branch matches', async () => {
+    const cm = new StubCm(Array.from({ length: 6 }, (_, i) => msg(`m${i}`, T0 + i, `message ${i}`)));
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    for (const id of ['m0', 'm1', 'm2']) cm.hide(id);
+    const res = await m.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'message', limit: 3 } });
+    const data = res.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number } };
+    assert.deepEqual(data.hits.map((h) => h.id), ['msg:m3', 'msg:m4', 'msg:m5']);
+    await m.stop();
+  });
+
+  it('G2#4 an edit to nothing indexable is retried when /delete fails, and hidden at search time when /delete is missing', async () => {
+    const cm = new StubCm([msg('e', T0, 'text that will be blanked'), msg('f', T0 + 1, 'another message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.edit('e', '');
+    svc.deleteStatus = 500;
+    await m.syncSemanticIndex();
+    svc.deleteStatus = null;
+    await m.syncSemanticIndex();
+    assert.ok(!svc.items.has('msg:e'), 'blanked message deleted once /delete recovers');
+
+    const cm2 = new StubCm([msg('g', T0, 'text that will be blanked'), msg('h', T0 + 1, 'another message')]);
+    svc.items.clear();
+    const m2 = mod(cm2);
+    await m2.syncSemanticIndex();
+    cm2.edit('g', '');
+    svc.deleteStatus = 404;
+    await m2.syncSemanticIndex();
+    const res = await m2.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'blanked' } });
+    assert.ok(!(res.data as { hits: Array<{ id: string }> }).hits.some((h) => h.id === 'msg:g'), 'stale snippet of a blanked message is not served');
+    await m.stop(); await m2.stop();
+  });
+
+  it('G2#5 queued edits spend the catch-up budget', async () => {
+    const store = Array.from({ length: 300 }, (_, i) => msg(`m${i}`, T0 + i * 3_600_000, `message ${i}`));
+    const cm = new StubCm(store);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    for (let i = 0; i < 300; i++) cm.edit(`m${i}`, `edited message ${i}`);
+    const r = await m.syncSemanticIndex(100)!;
+    assert.ok(r.pushed <= 100, `pushed ${r.pushed} with a budget of 100`);
+    assert.equal(r.more, true);
+    for (let i = 0; i < 5; i++) await m.syncSemanticIndex(100);
+    assert.equal(svc.items.get('msg:m299')?.text, 'edited message 299');
+    await m.stop();
   });
 });
