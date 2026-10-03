@@ -346,24 +346,27 @@ export class SemanticIndexer {
         // Edits spend the budget like any other upsert, so a large queue left
         // by an outage cannot make a search's bounded catch-up unbounded; the
         // rest stay queued for the next pass.
-        const edited = [...this.editedIds].slice(0, Math.max(0, budget));
-        budget -= edited.length;
+        // Only actionable edits (an upsert or a delete) spend it: one whose
+        // message left the branch is dropped for free.
         this.removedIds.clear();
-        for (const id of edited) this.editedIds.delete(id);
-        if (this.editedIds.size > 0) report.more = true;
+        const edited: string[] = [];
         const toDelete = removed.map((id) => `msg:${id}`);
         const blanked: string[] = [];
         const toUpsert: IndexItem[] = [];
-        for (const id of edited) {
+        for (const id of [...this.editedIds]) {
+          if (budget <= 0) break;
+          this.editedIds.delete(id);
           const m = this.cm.getMessage(id as never);
           // Not on the current branch (e.g. /undo after the edit): drop it,
           // never delete — /redo brings the message back and the time walk
           // will not revisit it. Search-time branch checks hide it meanwhile.
           if (!m) continue;
+          edited.push(id); budget--;
           const item = messageToItem(m, this.cfg);
           // On the branch but edited down to nothing indexable: delete.
           if (item) toUpsert.push(item); else { toDelete.push(`msg:${id}`); blanked.push(id); }
         }
+        if (this.editedIds.size > 0) report.more = true;
         if (toDelete.length > 0) {
           try {
             await this.client.delete(toDelete);

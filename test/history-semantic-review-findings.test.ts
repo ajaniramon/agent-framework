@@ -315,4 +315,31 @@ describe('semantic sync: Greptile #173 findings', () => {
     assert.equal(svc.items.get('msg:m299')?.text, 'edited message 299');
     await m.stop();
   });
+
+  // ---- Greptile round 3 at f2bcf12 ----
+
+  it('G3#1 a hit for an edited message never serves the pre-edit text as its snippet', async () => {
+    const cm = new StubCm([msg('e', T0, 'public part. SECRET passage that was edited out'), msg('f', T0 + 1, 'another message')]);
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+    m.bind(cm as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    cm.edit('e', 'public part.');
+    const res = await m.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'secret' } });
+    const hit = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits.find((h) => h.id === 'msg:e');
+    assert.ok(hit, 'the message is still a hit');
+    assert.ok(!hit.snippet.includes('SECRET'), `stale snippet served: ${hit.snippet}`);
+    assert.equal(hit.snippet, 'public part.');
+    await m.stop();
+  });
+
+  it('G3#2 queued edits for messages that left the branch do not spend the sync budget', async () => {
+    const cm = new StubCm(Array.from({ length: 300 }, (_, i) => msg(`m${i}`, T0 + i * 3_600_000, `message ${i}`)));
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    for (let i = 0; i < 300; i++) { cm.edit(`m${i}`, `edited ${i}`); cm.hide(`m${i}`); }
+    cm.messages.push(msg('new', T0 + 400 * 3_600_000, 'a new message after the undo'));
+    await m.syncSemanticIndex(100);
+    assert.ok(svc.items.has('msg:new'), 'new history indexed in the same pass');
+    await m.stop();
+  });
 });

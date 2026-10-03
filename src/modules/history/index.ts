@@ -147,6 +147,10 @@ const SEMANTIC_DEFAULT_LIMIT = 10;
 const SEMANTIC_MAX_LIMIT = 50;
 /** Largest k sent to the embed-service when over-fetching past dropped hits (its own cap is 200). */
 const SEMANTIC_MAX_FETCH = 200;
+/** Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text. */
+function snippetOf(text: string): string {
+  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${text.slice(0, SEMANTIC_SNIPPET_CHARS)}…`;
+}
 const SEMANTIC_SNIPPET_CHARS = 400;
 
 /**
@@ -475,7 +479,8 @@ export class HistoryModule implements Module {
         'background sync is already running, the search waits for that run to finish instead). ' +
         'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
         'before they come back: a message you undid or a summary from a branch you left is dropped and ' +
-        'counted in index.droppedOffBranch.',
+        'counted in index.droppedOffBranch; a message edited down to nothing searchable is dropped and ' +
+        'counted in index.droppedStale. Message snippets always show the current text of the message.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -822,13 +827,20 @@ export class HistoryModule implements Module {
     // 200) so lower-ranked on-branch matches still fill `limit`.
     const cm = this.cm as ContextManager;
     const includePrivate = this.semanticCfg.includePrivateTools ?? true;
+    // A message hit's snippet is rebuilt from the CURRENT local text, never
+    // the remote copy: an edit not yet synced (or one the index never got)
+    // must not leak a passage the edit removed. Only the ranking can be stale.
+    const currentText = new Map<string, string>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
       const sumId = /^sum:(.+)$/.exec(h.id)?.[1];
       if (msgId !== undefined) {
         const m = cm.getMessage(msgId);
         if (!m) return 'offBranch';
-        return messageIndexText(m, includePrivate) ? 'ok' : 'stale';
+        const text = messageIndexText(m, includePrivate).slice(0, this.semanticCfg!.maxChars ?? 32_000);
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
+        return 'ok';
       }
       if (sumId !== undefined) return cm.getSummary(sumId) !== null ? 'ok' : 'offBranch';
       return 'ok';
@@ -862,8 +874,8 @@ export class HistoryModule implements Module {
       channelId: h.channel,
       participant: (h.meta as { participant?: unknown }).participant ?? null,
       author: (h.meta as { author?: unknown }).author ?? null,
-      snippet: h.text ?? '',
-      chars: h.chars,
+      snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
+      chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
     }));
     return {
       success: true,
