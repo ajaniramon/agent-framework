@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { SemanticIndexClient, SemanticIndexer, type SemanticIndexConfig, type SyncReport } from './semantic.js';
+import { SemanticIndexClient, SemanticIndexer, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 
 // ============================================================================
 // Tool input shapes
@@ -297,7 +297,15 @@ export class HistoryModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
-    this.indexer?.attach();
+    if (this.indexer) {
+      // Pending edits/removals survive a restart through module state.
+      this.indexer.restorePending(ctx.getState<{ semanticPending?: PendingChanges }>()?.semanticPending);
+      this.indexer.onPendingChange = (p) => {
+        const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+        this.ctx?.setState({ ...prev, semanticPending: p });
+      };
+      this.indexer.attach();
+    }
     this.startSyncTimer();
   }
 
@@ -305,6 +313,7 @@ export class HistoryModule implements Module {
     this.ctx = null;
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
     if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
+    if (this.indexer) this.indexer.onPendingChange = null;
     this.indexer?.dispose();
   }
 
@@ -450,7 +459,8 @@ export class HistoryModule implements Module {
         '(text plus your own think/journal/skip_reply notes) and every compression summary. Use it when you ' +
         'remember roughly what something was about but not the words — "the night the fluid sim was read ' +
         'back to me as art" — then narrow with `from`/`to`/`channelId` and drill into the exact span with ' +
-        '`extract` or `overview`. Results are ranked by cosine similarity (score ~0.6+ is a strong match, ' +
+        '`extract` or `overview` (for a message hit, `extract({ aroundId: messageId })` opens the conversation ' +
+        'around it — use the raw `messageId` field, not the `msg:` id). Results are ranked by cosine similarity (score ~0.6+ is a strong match, ' +
         '~0.3 is thematic, below ~0.2 is noise); each hit carries its id (`msg:<id>` or `sum:<id>`), ' +
         'timestamp, channel, kind/level and a snippet. The index catches up with recent messages before ' +
         'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking; if a ' +
@@ -810,6 +820,8 @@ export class HistoryModule implements Module {
     });
     const hits = onBranch.map((h) => ({
       id: h.id,
+      /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
+      messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
       kind: h.kind,
       level: h.level,
       score: h.score,

@@ -120,6 +120,7 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(res.success, true, JSON.stringify(res));
     const data = res.data as { hits: Array<{ id: string; score: number; timestamp: string; channelId: string | null }>; index: { indexed: number; behind: boolean } };
     assert.equal(data.hits[0]!.id, 'msg:m1');
+    assert.equal((data.hits[0] as unknown as { messageId: string }).messageId, 'm1');
     assert.equal(data.hits[0]!.channelId, 'chan-A');
     assert.equal(data.hits[0]!.timestamp, new Date(T0 + 1000).toISOString());
     assert.equal(data.index.behind, false);

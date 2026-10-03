@@ -230,6 +230,9 @@ export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): Index
   };
 }
 
+/** Edits/removals not yet applied to the index (persisted by the host across restarts). */
+export interface PendingChanges { edited: string[]; removed: string[] }
+
 export interface SyncReport {
   pushed: number;
   inserted: number;
@@ -259,22 +262,44 @@ export class SemanticIndexer {
    * Edits and removals since the last successful sync. The time-cursor walk
    * only revisits the overlap window, so an edit to an older message (its
    * timestamp does not change) or a removal would otherwise never reach the
-   * index. In memory only: events that land while the module is detached or
-   * before a restart are not replayed (removals are still hidden at search
-   * time by the current-branch check in HistoryModule).
+   * index. The host persists the pending sets through `onPendingChange` /
+   * `restorePending` (HistoryModule keeps them in module state), so edits
+   * made during an embed-service outage survive a restart. Events that land
+   * while the module is detached are not replayed (removals are still hidden
+   * at search time by the current-branch check in HistoryModule).
    */
   private readonly editedIds = new Set<string>();
   private readonly removedIds = new Set<string>();
   private detach: (() => void) | null = null;
+  /** Set once the service answers 404 to /delete (a build without the route): removals are dropped from then on. */
+  private deleteUnsupported = false;
+  /** Called whenever the pending edit/remove sets change. */
+  onPendingChange: ((p: PendingChanges) => void) | null = null;
 
-  /** Subscribe to message-store edits/removals. Idempotent; a CM without onMessage is tolerated. */
+  pendingSnapshot(): PendingChanges { return { edited: [...this.editedIds], removed: [...this.removedIds] }; }
+
+  restorePending(p: PendingChanges | null | undefined): void {
+    for (const id of p?.removed ?? []) { this.removedIds.add(id); this.editedIds.delete(id); }
+    for (const id of p?.edited ?? []) if (!this.removedIds.has(id)) this.editedIds.add(id);
+  }
+
+  private pendingChanged(): void { this.onPendingChange?.(this.pendingSnapshot()); }
+
+  /** Subscribe to message-store edits/removals. Idempotent. */
   attach(): void {
     if (this.detach) return;
     const on = (this.cm as { onMessage?: ContextManager['onMessage'] }).onMessage;
-    if (typeof on !== 'function') return;
+    if (typeof on !== 'function') {
+      this.log('[history/semantic] context-manager has no onMessage: edits and removals will not reach the index');
+      return;
+    }
     this.detach = on.call(this.cm, (e) => {
-      if (e.type === 'edit') { this.editedIds.add(String(e.messageId)); }
-      else if (e.type === 'remove') { const id = String(e.messageId); this.editedIds.delete(id); this.removedIds.add(id); }
+      if (e.type === 'edit') { this.editedIds.add(String(e.messageId)); this.pendingChanged(); }
+      else if (e.type === 'remove') {
+        const id = String(e.messageId); this.editedIds.delete(id);
+        if (!this.deleteUnsupported) this.removedIds.add(id);
+        this.pendingChanged();
+      }
       // removeRange carries only its endpoints; removed ids in it are hidden at search time instead.
     });
   }
@@ -312,29 +337,57 @@ export class SemanticIndexer {
       };
 
       // Edits and removals first: they never come back round in the time walk.
+      // This phase fails on its own: a failure re-queues its ids, is logged
+      // and reported via lastError, and the tick falls through to summaries
+      // and the time walk, so one bad delete/upsert cannot freeze indexing.
+      let phaseError: string | null = null;
       if (this.removedIds.size > 0 || this.editedIds.size > 0) {
         const removed = [...this.removedIds];
         const edited = [...this.editedIds];
         this.removedIds.clear(); this.editedIds.clear();
-        try {
-          const toDelete = removed.map((id) => `msg:${id}`);
-          const toUpsert: IndexItem[] = [];
-          for (const id of edited) {
-            const m = this.cm.getMessage(id as never);
-            const item = m ? messageToItem(m, this.cfg) : null;
-            if (item) toUpsert.push(item); else toDelete.push(`msg:${id}`);
+        const toDelete = removed.map((id) => `msg:${id}`);
+        const toUpsert: IndexItem[] = [];
+        for (const id of edited) {
+          const m = this.cm.getMessage(id as never);
+          // Not on the current branch (e.g. /undo after the edit): drop it,
+          // never delete — /redo brings the message back and the time walk
+          // will not revisit it. Search-time branch checks hide it meanwhile.
+          if (!m) continue;
+          const item = messageToItem(m, this.cfg);
+          // On the branch but edited down to nothing indexable: delete.
+          if (item) toUpsert.push(item); else toDelete.push(`msg:${id}`);
+        }
+        if (toDelete.length > 0) {
+          try {
+            await this.client.delete(toDelete);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (/→ 404/.test(msg)) {
+              // A service build without /delete (or a namespace that does
+              // not exist). Drop the removals: search-time branch checks
+              // already keep them out of results.
+              this.deleteUnsupported = true;
+              this.log(`[history/semantic] /delete unsupported by the embed-service; dropping ${toDelete.length} removal(s): ${msg}`);
+            } else {
+              for (const id of removed) this.removedIds.add(id);
+              phaseError = msg;
+              this.log(`[history/semantic] delete failed, ${removed.length} removal(s) re-queued: ${msg}`);
+            }
           }
-          if (toDelete.length > 0) await this.client.delete(toDelete);
+        }
+        try {
           for (let i = 0; i < toUpsert.length; i += batchSize) {
             const chunk = toUpsert.slice(i, i + batchSize);
             const r = await this.client.upsert(chunk);
             report.pushed += chunk.length; report.inserted += r.inserted; report.updated += r.updated; report.unchanged += r.unchanged;
           }
         } catch (e) {
-          for (const id of removed) this.removedIds.add(id);
+          const msg = e instanceof Error ? e.message : String(e);
           for (const id of edited) if (!this.removedIds.has(id)) this.editedIds.add(id);
-          throw e;
+          phaseError = msg;
+          this.log(`[history/semantic] edit re-upsert failed, ${edited.length} edit(s) re-queued: ${msg}`);
         }
+        this.pendingChanged();
       }
 
       // Summaries before messages: they are few, and a message backlog that
@@ -354,6 +407,10 @@ export class SemanticIndexer {
       }
 
       // Messages: walk forward from (watermark - overlap) via the time index.
+      // Sound because rows are stamped at append time (CM addMessage takes no
+      // timestamp). An importer that writes historical stamps into a live
+      // store, or a backward clock step past the overlap, lands behind the
+      // watermark and is never indexed.
       let fromMs = msgWm === null ? undefined : Math.max(0, msgWm - (this.cfg.overlapMs ?? 600_000));
       // Messages at exactly `fromMs` already seen this pass. The query bounds
       // are inclusive, so the next page starts at the last page's final
@@ -386,7 +443,7 @@ export class SemanticIndexer {
         fromMs = lastMs;
       }
       await flush();
-      this.consecutiveFailures = 0; this.lastError = null; this.lastSyncAt = Date.now();
+      this.consecutiveFailures = 0; this.lastError = phaseError; this.lastSyncAt = Date.now();
       return report;
     } catch (e) {
       this.consecutiveFailures++;

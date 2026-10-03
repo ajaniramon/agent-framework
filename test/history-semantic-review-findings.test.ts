@@ -17,6 +17,8 @@ class FakeService {
   items = new Map<string, Item>();
   calls: string[] = [];
   deleted: string[] = [];
+  /** When set, /delete answers this status instead of deleting. */
+  deleteStatus: number | null = null;
   server!: Server;
   url = '';
   async start(): Promise<void> {
@@ -45,6 +47,7 @@ class FakeService {
           return json(200, { inserted, updated: 0, unchanged, count: this.items.size });
         }
         if (m[2] === 'delete') {
+          if (this.deleteStatus !== null) return json(this.deleteStatus, { error: { message: 'delete failed' } });
           const ids = (JSON.parse(body) as { ids: string[] }).ids;
           let n = 0; for (const id of ids) if (this.items.delete(id)) n++;
           this.deleted.push(...ids);
@@ -93,6 +96,8 @@ class StubCm {
     (m as { content: ContentBlock[] }).content = [{ type: 'text', text }];
     for (const l of this.listeners) l({ type: 'edit', messageId: id });
   }
+  /** Branch switch (/undo): the message leaves the current branch with no remove event. */
+  hide(id: string) { this.messages = this.messages.filter((m) => m.id !== id); }
   remove(id: string) {
     this.messages = this.messages.filter((m) => m.id !== id);
     for (const l of this.listeners) l({ type: 'remove', messageId: id });
@@ -105,7 +110,7 @@ describe('semantic sync: Greptile #173 findings', () => {
   const svc = new FakeService();
   before(() => svc.start());
   after(() => svc.stop());
-  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; });
+  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; });
 
   function mod(cm: StubCm): HistoryModule {
     const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
@@ -169,5 +174,66 @@ describe('semantic sync: Greptile #173 findings', () => {
     await m.syncSemanticIndex();
     assert.equal(svc.items.get('msg:t')?.text, '[think] wait for Ben');
     await m.stop();
+  });
+
+  it('re-review #1: a failing /delete does not freeze indexing; the removal is retried on the next tick', async () => {
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.remove('a');
+    cm.messages.push(msg('c', T0 + 2, 'a new message after the removal'));
+    svc.deleteStatus = 500;
+    await m.syncSemanticIndex();
+    assert.ok(svc.items.has('msg:c'), 'new messages still index while /delete fails');
+    assert.ok(svc.items.has('msg:a'));
+    svc.deleteStatus = null;
+    await m.syncSemanticIndex();
+    assert.ok(!svc.items.has('msg:a'), 'the queued removal is retried once /delete works');
+    await m.stop();
+  });
+
+  it('re-review #1: a 404 from /delete (service without the route) drops the removals instead of retrying forever', async () => {
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.remove('a');
+    cm.messages.push(msg('c', T0 + 2, 'a new message after the removal'));
+    svc.deleteStatus = 404;
+    await m.syncSemanticIndex();
+    assert.ok(svc.items.has('msg:c'), 'new messages still index when /delete is missing');
+    svc.calls.length = 0;
+    svc.deleteStatus = null;
+    await m.syncSemanticIndex();
+    assert.ok(!svc.calls.includes('delete'), `removal retried after a 404: ${JSON.stringify(svc.calls)}`);
+    await m.stop();
+  });
+
+  it('re-review #2: an edited message that left the branch (/undo) is dropped, not deleted from the index', async () => {
+    const cm = new StubCm([msg('e', T0, 'the original wording'), msg('f', T0 + 1, 'another message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.edit('e', 'the edited wording');
+    cm.hide('e');
+    await m.syncSemanticIndex();
+    assert.deepEqual(svc.deleted, []);
+    assert.ok(svc.items.has('msg:e'), 'still indexed for when /redo brings it back');
+    await m.stop();
+  });
+
+  it('pending edits survive a module restart via module state', async () => {
+    const cm = new StubCm([msg('p', T0, 'the original wording'), msg('q', T0 + 3_600_000, 'an hour later')]);
+    let state: unknown = null;
+    const ctx = { getState: () => state, setState: (v: unknown) => { state = v; } } as never;
+    const m1 = mod(cm);
+    await m1.start(ctx);
+    await m1.syncSemanticIndex();
+    cm.edit('p', 'the corrected wording');
+    await m1.stop();
+    cm.listeners.clear();
+    const m2 = mod(cm);
+    await m2.start(ctx);
+    await m2.syncSemanticIndex();
+    assert.equal(svc.items.get('msg:p')?.text, 'the corrected wording');
+    await m2.stop();
   });
 });
