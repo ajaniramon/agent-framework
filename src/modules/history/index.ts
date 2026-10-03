@@ -145,6 +145,10 @@ const EXTRACT_FILTER_MAX_MAX_SCAN = 50000;
 /** How far (in window positions) a filtered-extract resume looks for its
  *  `afterId` when the window moved since the previous call. */
 const RELOCATE_RADIUS = 1000;
+/** Most appends a no-channel resume walks back through to check for
+ *  messages added behind its cursor; past it the check is reported as
+ *  unverified rather than failing. */
+const APPENDED_SCAN_CAP = 200_000;
 /** Native page size for the in-process filtered scans above. */
 const FILTER_SCAN_PAGE = 1000;
 
@@ -357,25 +361,31 @@ export class HistoryModule implements Module {
   }
 
   /**
-   * Messages appended since `seqMark`, walking the store's append tail back
-   * until a sequence ≤ seqMark. Null when more than RELOCATE_RADIUS were
-   * appended — too many to check cheaply.
+   * Of the messages appended since `seqMark` (the store's append tail above
+   * it, walked back in pages), the ones `relevant` keeps. Unrelated appends
+   * cost a look but never count. `complete` is false when the walk stopped
+   * at APPENDED_SCAN_CAP before reaching seqMark — the result is then a
+   * lower bound, not a verification.
    */
-  private appendedSince(seqMark: number): StoredMessage[] | null {
+  private appendedSince(
+    seqMark: number,
+    relevant: (m: StoredMessage) => boolean,
+  ): { messages: StoredMessage[]; complete: boolean } {
     const cm = this.cm as ContextManager;
     const out: StoredMessage[] = [];
+    let looked = 0;
     let end = cm.getMessageCount();
     while (end > 0) {
-      const start = Math.max(0, end - 100);
+      const start = Math.max(0, end - 1000);
       const w = cm.getMessageWindow(start, end - start).messages;
       for (let i = w.length - 1; i >= 0; i--) {
-        if (w[i]!.sequence <= seqMark) return out;
-        out.push(w[i]!);
-        if (out.length > RELOCATE_RADIUS) return null;
+        if (w[i]!.sequence <= seqMark) return { messages: out, complete: true };
+        if (relevant(w[i]!)) out.push(w[i]!);
+        if (++looked >= APPENDED_SCAN_CAP) return { messages: out, complete: false };
       }
       end = start;
     }
-    return out;
+    return { messages: out, complete: true };
   }
 
   /**
@@ -813,27 +823,23 @@ export class HistoryModule implements Module {
       // always lands after the cursor and is simply scanned.)
       const seqMarkNow = channelId === undefined ? this.storeSeqMark() : undefined;
       let missed: StoredMessage[] = [];
+      let unverified = false;
       if (channelId === undefined && windowOffset > 0) {
         if (typeof input.seqMark !== 'number') {
           throw new Error(
             '"windowOffset" without channelId needs the "seqMark" from the same `resume` object. Pass the whole `resume` object back.',
           );
         }
-        const added = this.appendedSince(input.seqMark);
-        if (added === null) {
-          throw new Error(
-            `More than ${RELOCATE_RADIUS} messages were added since the previous call, too many to check against the ` +
-              'resume point. Restart the scan without windowOffset, or narrow it with from/to/channelId.',
-          );
-        }
         const cursor = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, limit: 1, offset: windowOffset - 1 }).messages[0];
         if (cursor) {
           const ct = cursor.timestamp.getTime();
-          missed = added.filter((m) => {
+          const r = this.appendedSince(input.seqMark, (m) => {
             const ts = m.timestamp.getTime();
             if ((fromMs !== undefined && ts < fromMs) || (toMs !== undefined && ts > toMs)) return false;
             return ts < ct || (ts === ct && m.sequence < cursor.sequence);
           });
+          missed = r.messages;
+          unverified = !r.complete;
         }
       }
       const page: StoredMessage[] = [];
@@ -903,10 +909,19 @@ export class HistoryModule implements Module {
           returned: page.length,
           scanned,
           truncated: !exhausted,
-          ...(shift !== 0 || missed.length > 0
+          ...(shift !== 0 || missed.length > 0 || unverified
             ? {
                 windowChanged: {
                   shift,
+                  ...(unverified
+                    ? {
+                        unverified: true,
+                        unverifiedNote:
+                          `More than ${APPENDED_SCAN_CAP} messages were appended since the previous call; only the newest ` +
+                          'were checked, so messages may have been added behind the resume point unseen. Restart without ' +
+                          'windowOffset, or narrow with from/to/channelId, if that matters.',
+                      }
+                    : {}),
                   ...(channelId === undefined
                     ? {
                         addedBefore: missed.length,
@@ -918,7 +933,9 @@ export class HistoryModule implements Module {
                     missed.length > 0 || shift > 0
                       ? `${missed.length || shift} message(s) were added to the window before the resume point since the previous call; this scan chain did not see them` +
                         (channelId === undefined ? ' (matching ones listed in missedIds).' : '.')
-                      : `${-shift} message(s) before the resume point were removed since the previous call; the resume was re-anchored, nothing skipped.`,
+                      : shift < 0
+                        ? `${-shift} message(s) before the resume point were removed since the previous call; the resume was re-anchored, nothing skipped.`
+                        : 'No change found behind the resume point, but the check was incomplete (see unverifiedNote).',
                 },
               }
             : {}),

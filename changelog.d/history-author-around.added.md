@@ -20,6 +20,8 @@
   instead of silently skipping. Without a channel (a time-ordered window) the
   resume also carries `seqMark`, and messages appended since then that landed
   behind the cursor are reported in `windowChanged.missedIds` even when a
-  removal balanced them out (shift 0). A resumed call reports
+  removal balanced them out (shift 0). Unrelated appends don't count; past
+  200,000 appends since the mark the check is reported as
+  `windowChanged.unverified` instead of failing. A resumed call reports
   `matchedSinceWindowOffset` rather than a total.
   `aroundId` also accepts a `semantic_search` `msg:<id>` hit id.

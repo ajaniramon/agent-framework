@@ -308,6 +308,15 @@ describe('HistoryModule on a real store: window changes between resume calls (PR
     assert.deepEqual(second.windowChanged.missedIds, [m.get('late')]);
   });
 
+  it('extract author resume (no channel) is not broken by many unrelated appends since seqMark', async () => {
+    const { mod, append } = build(rowsN(9));
+    const first = await call(mod, 'extract', { author: 'antra', limit: 4 });
+    for (let i = 0; i < 1500; i++) append({ text: `busy${i}`, channel: 'other', author: 'bob', ms: Date.now() });
+    const second = await call(mod, 'extract', { author: 'antra', limit: 4, ...first.resume });
+    assert.deepEqual(texts2(second), ['m4', 'm5', 'm6', 'm7']);
+    assert.equal(second.windowChanged, undefined);
+  });
+
   it('extract author resume in a channel window: a late append lands after the cursor and is simply returned', async () => {
     const { mod, append, remove } = build(rowsN(9));
     const q = { author: 'antra', limit: 4, channelId: 'd' };
