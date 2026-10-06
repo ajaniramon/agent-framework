@@ -19,13 +19,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import type { WorkspaceModuleState } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
-function makeCtx(): ModuleContext {
+function makeCtx(opts: {
+  saved?: WorkspaceModuleState;
+  onSave?: (state: WorkspaceModuleState) => void;
+} = {}): ModuleContext {
   return {
-    isRestart: false,
-    getState: <T,>() => null as T | null,
-    setState: () => {},
+    isRestart: opts.saved !== undefined,
+    getState: <T,>() => (opts.saved ?? null) as T | null,
+    setState: (state: WorkspaceModuleState) => opts.onSave?.(state),
     pushEvent: () => {},
   } as unknown as ModuleContext;
 }
@@ -39,11 +43,14 @@ function setup(t: TestContext) {
     store.close();
     rmSync(root, { recursive: true, force: true });
   });
-  const module = new WorkspaceModule({
-    mounts: [{ name: 'work', path: dir, mode: 'read-write' as const, watch: 'never' as const }],
-  });
-  module.initStore(store);
-  return { store, dir, module };
+  const makeModule = () => {
+    const m = new WorkspaceModule({
+      mounts: [{ name: 'work', path: dir, mode: 'read-write' as const, watch: 'never' as const }],
+    });
+    m.initStore(store);
+    return m;
+  };
+  return { store, dir, module: makeModule(), makeModule };
 }
 
 type MaterializeData = {
@@ -179,4 +186,102 @@ test('untouched disk copies and brand-new files materialize exactly as before', 
   assert.equal(data.skipped ?? undefined, undefined, 'no spurious refusals');
   assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo v2');
   assert.equal(readFileSync(join(dir, 'new.txt'), 'utf8'), 'fresh');
+});
+
+test('after sync adopts a shell edit, the next agent edit materializes (baseline re-pinned)', async (t) => {
+  const { dir, module } = setup(t);
+  await module.start(makeCtx());
+  await seedBaseline(module, dir);
+
+  writeFileSync(join(dir, 'script.sh'), 'echo edited-by-shell');
+  await call(module, 'sync', {});
+  await call(module, 'write', { path: 'work/script.sh', content: 'echo v3-on-top-of-shell' });
+
+  // A stale baseline (still 'echo v1') would read the adopted edit as a new
+  // external change and refuse this forever, sync or no sync.
+  const res = await call(module, 'materialize', {});
+  const data = res.data as MaterializeData;
+  assert.equal(data.skipped ?? undefined, undefined, `no refusal expected, got: ${JSON.stringify(data)}`);
+  assert.deepEqual(data.materialized.map((m) => m.path), ['script.sh']);
+  assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo v3-on-top-of-shell');
+});
+
+test('a refusal does not hold back the sequence the branch guard reads', async (t) => {
+  const { store, dir, module } = setup(t);
+  await module.start(makeCtx());
+  await seedBaseline(module, dir);
+
+  // script.sh will be refused; other.txt is written in the same materialize.
+  writeFileSync(join(dir, 'script.sh'), 'echo edited-by-shell');
+  await call(module, 'write', { path: 'work/script.sh', content: 'echo v2' });
+  const forkAt = store.currentSequence();
+  await call(module, 'write', { path: 'work/other.txt', content: 'from main' });
+  const res = await call(module, 'materialize', {});
+  assert.deepEqual((res.data as MaterializeData).materialized.map((m) => m.path), ['other.txt']);
+
+  // A branch forked BEFORE other.txt was written never had it: disk holds
+  // main's write, so this is divergence and the guard must refuse.
+  store.createBranchAt('child', store.currentBranch().name, forkAt);
+  store.switchBranch('child');
+  await call(module, 'write', { path: 'work/other.txt', content: 'from child' });
+  const blocked = await module.handleToolCall({ id: 't', name: 'materialize', input: {} });
+  assert.equal(blocked.success, false, 'divergent branch must be refused');
+  assert.match(String(blocked.error), /diverged/);
+  assert.equal(readFileSync(join(dir, 'other.txt'), 'utf8'), 'from main');
+});
+
+test('a first materialize that finds every file in place still pins the branch', async (t) => {
+  const { store, dir, module } = setup(t);
+  await module.start(makeCtx());
+
+  await call(module, 'write', { path: 'work/a.txt', content: 'a' });
+  const forkAt = store.currentSequence();
+  await call(module, 'write', { path: 'work/b.txt', content: 'b' });
+  // Disk already holds the same bytes (e.g. restored from a backup).
+  writeFileSync(join(dir, 'a.txt'), 'a');
+  writeFileSync(join(dir, 'b.txt'), 'b');
+
+  const first = await call(module, 'materialize', {});
+  assert.equal((first.data as MaterializeData).materialized.length, 0, 'nothing needed writing');
+  const status = (await call(module, 'status', {})).data as Record<string, { lastMaterializedBranch: string | null }>;
+  assert.equal(status.work.lastMaterializedBranch, store.currentBranch().id, 'the branch is pinned');
+
+  // So a branch that diverged before b.txt is refused rather than let through.
+  store.createBranchAt('child', store.currentBranch().name, forkAt);
+  store.switchBranch('child');
+  await call(module, 'write', { path: 'work/a.txt', content: 'a from child' });
+  const blocked = await module.handleToolCall({ id: 't', name: 'materialize', input: {} });
+  assert.equal(blocked.success, false, 'divergent branch must be refused');
+  assert.equal(readFileSync(join(dir, 'a.txt'), 'utf8'), 'a');
+});
+
+test('baselines and refused paths survive a restart', async (t) => {
+  const { dir, module, makeModule } = setup(t);
+  let saved: WorkspaceModuleState | undefined;
+  await module.start(makeCtx({ onSave: (s) => { saved = s; } }));
+  await seedBaseline(module, dir);
+
+  // One refusal before the restart, one divergence that happens across it.
+  await call(module, 'write', { path: 'work/notes.txt', content: 'n1' });
+  await call(module, 'materialize', {});
+  writeFileSync(join(dir, 'notes.txt'), 'notes edited by shell');
+  await call(module, 'write', { path: 'work/notes.txt', content: 'n2' });
+  const before = await call(module, 'materialize', {});
+  assert.ok(((before.data as MaterializeData).skipped ?? []).some((s) => s.reason.includes('notes.txt')));
+  await module.stop();
+  assert.ok(saved, 'state persisted on stop');
+
+  writeFileSync(join(dir, 'script.sh'), 'echo edited-by-shell-while-down');
+  const restarted = makeModule();
+  await restarted.start(makeCtx({ saved }));
+  await call(restarted, 'write', { path: 'work/script.sh', content: 'echo v2' });
+
+  const res = await call(restarted, 'materialize', {});
+  const data = res.data as MaterializeData;
+  assert.equal(data.materialized.length, 0, `nothing silently written, got: ${JSON.stringify(data)}`);
+  const reasons = (data.skipped ?? []).map((s) => s.reason);
+  assert.ok(reasons.some((r) => r.includes('script.sh') && /stale copy/.test(r)), 'the guard holds after a restart');
+  assert.ok(reasons.some((r) => r.includes('notes.txt')), 'the earlier refusal is still owed');
+  assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo edited-by-shell-while-down');
+  assert.equal(readFileSync(join(dir, 'notes.txt'), 'utf8'), 'notes edited by shell');
 });

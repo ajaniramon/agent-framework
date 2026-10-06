@@ -119,6 +119,7 @@ export async function syncFromFs(
         store.treeRemove(mount.treeStateId, relativePath);
         result.synced.push({ path: relativePath, op: 'deleted' });
       }
+      mount.materializedHashes.delete(relativePath);
       continue;
     }
 
@@ -153,7 +154,8 @@ export async function syncFromFs(
       const existing = store.treeGet(mount.treeStateId, relativePath);
 
       if (existing && existing.blobHash === hash) {
-        // No change
+        // No change. Disk and tree agree, so this is the baseline now.
+        mount.materializedHashes.set(relativePath, hashContent(buffer));
         continue;
       }
 
@@ -181,6 +183,12 @@ export async function syncFromFs(
       }
 
       store.treeSet(mount.treeStateId, relativePath, entry);
+      // The tree adopted the disk copy, so disk and tree agree: re-pin the
+      // baseline. Left at the old hash, materialize would read the adopted
+      // edit as a fresh external change and refuse every later agent edit
+      // to this file, with no sync able to clear it. Raw disk bytes, which is
+      // what materializeToFs compares against.
+      mount.materializedHashes.set(relativePath, hashContent(buffer));
       result.synced.push({ path: relativePath, op: existing ? 'modified' : 'created' });
     } catch (error) {
       result.skipped.push({
@@ -196,6 +204,9 @@ export async function syncFromFs(
 export interface MaterializeResult {
   /** Paths actually written to disk */
   written: string[];
+  /** Paths whose disk copy already held exactly the tree's bytes: nothing
+   *  written, but disk reflects the current tree for them all the same. */
+  unchanged: string[];
   /** Paths refused by the freshness guard, each with the reason — a silently
    *  overwritten shell edit is unrecoverable, so divergence must surface
    *  instead of being resolved toward the workspace copy (issue #109: a bulk
@@ -212,7 +223,13 @@ export interface MaterializeResult {
  * mismatch means another writer changed the file since, and the path is
  * refused loudly instead of silently reverted, unless `force`. Symmetric
  * with syncFromFs's conflict detection, and with the same blind spot: no
- * baseline (fresh process, never materialized) means no guard.
+ * baseline (never materialized, or synced) means no guard. Baselines and
+ * refused paths persist across restarts with the module state.
+ *
+ * Refused paths are kept in `mount.refusedPaths` and retried by every later
+ * materialize, so the diff watermark can still advance: holding it back
+ * would understate what disk holds to the branch guard, which reads the
+ * same sequence.
  *
  * @param store Chronicle store
  * @param mount Mount state
@@ -227,10 +244,11 @@ export async function materializeToFs(
   opts?: { force?: boolean },
 ): Promise<MaterializeResult> {
   if (mount.config.mode === 'read-only') {
-    return { written: [], skipped: [] };
+    return { written: [], unchanged: [], skipped: [] };
   }
 
   const written: string[] = [];
+  const unchanged: string[] = [];
   const skipped: SkippedFile[] = [];
 
   // Get changed files since last materialization
@@ -276,6 +294,18 @@ export async function materializeToFs(
     }));
   }
 
+  // Paths an earlier materialize refused are still owed. A path the tree no
+  // longer has is owed nothing.
+  if (!paths) {
+    const queued = new Set(filesToMaterialize.map((f) => f.path));
+    for (const p of mount.refusedPaths) {
+      if (queued.has(p)) continue;
+      const entry = store.treeGet(mount.treeStateId, p);
+      if (entry) filesToMaterialize.push({ path: p, blobHash: entry.blobHash });
+      else mount.refusedPaths.delete(p);
+    }
+  }
+
   for (const { path: relativePath, blobHash } of filesToMaterialize) {
     const absolutePath = safePath(mount.config.path, relativePath);
     if (!absolutePath) continue; // Path traversal — skip silently
@@ -299,6 +329,7 @@ export async function materializeToFs(
             `cannot verify disk copy (${code ?? (err as Error).message}) — ` +
             'fix its permissions and materialize again, or pass force to overwrite it',
         });
+        mount.refusedPaths.add(relativePath);
         continue;
       }
     }
@@ -308,6 +339,8 @@ export async function materializeToFs(
         // Disk already holds exactly these bytes: re-pin the baseline and
         // leave the file (and its mtime) alone.
         mount.materializedHashes.set(relativePath, blobHash);
+        mount.refusedPaths.delete(relativePath);
+        unchanged.push(relativePath);
         continue;
       }
       const baselineHash = mount.materializedHashes.get(relativePath);
@@ -318,6 +351,7 @@ export async function materializeToFs(
             'stale copy: disk changed since last materialize (another writer) — ' +
             'sync first to adopt the disk version, or pass force to overwrite it',
         });
+        mount.refusedPaths.add(relativePath);
         continue;
       }
     }
@@ -331,17 +365,12 @@ export async function materializeToFs(
 
     // Record blob hash at materialization time for conflict detection
     mount.materializedHashes.set(relativePath, blobHash);
+    mount.refusedPaths.delete(relativePath);
   }
 
-  // A skipped path must stay pending: advancing the watermark past it would
-  // drop it from every future incremental diff, turning a loud refusal into
-  // a permanent silent one. Re-attempting already-written files is free —
-  // they short-circuit on the identical-bytes check above.
-  if (skipped.length === 0) {
-    mount.lastMaterializedSeq = currentSeq;
-  }
+  mount.lastMaterializedSeq = currentSeq;
 
-  return { written, skipped };
+  return { written, unchanged, skipped };
 }
 
 /**
