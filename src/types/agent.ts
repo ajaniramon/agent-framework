@@ -12,6 +12,7 @@ export type SameRoundThinkTextPolicySource =
  * Configuration for an agent.
  */
 export interface AgentConfig {
+  toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
   /** Unique name for this agent */
   name: string;
 
@@ -170,6 +171,12 @@ export interface AgentConfig {
     announceHumanTurns?: boolean;
   };
 
+  /** Opt-in tool-output admission and one guarded retry after a provider
+   * refusal. Agents can persistently override this via agent_settings
+   * tool_result_guard. Full originals remain in Chronicle's audit history.
+   * Default false. Disabling does not restore previously withheld output. */
+  toolResultGuard?: boolean;
+
   /**
    * How the agent's PLAIN PROSE (non-tool output) reaches channels.
    * - 'locus' (default): host-inferred — the turn-frozen locus machinery.
@@ -296,6 +303,9 @@ export interface CompletedToolCall {
  * Inference request for an agent.
  */
 export interface InferenceRequest {
+  /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
+  coalescingSubject?: string;
+  coalescingEventId?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -336,4 +346,10 @@ export interface InferenceRequest {
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
+  /** Suppress every automatic plain-prose delivery for this logical turn.
+   * Explicit tool calls remain available. Used by authenticated silent wakes. */
+  suppressProse?: boolean;
+  /** Ephemeral system-position prompt for this turn only. Never written to
+   * Chronicle; callers must supply bounded non-secret control text. */
+  ephemeralSystemPrompt?: string;
 }

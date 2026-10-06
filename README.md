@@ -53,6 +53,11 @@ await server.start();
 
 An agent wraps an LLM identity: model, system prompt, context strategy, and tool permissions. Multiple agents can coexist, each with independent context and inference state.
 
+Agents can opt into the [tool result guard](docs/tool-result-guard.md) through
+`agent_settings` with `{"action":"update","tool_result_guard":true}`. The
+setting persists across restarts; withheld results remain recoverable in
+Chronicle's audit history.
+
 ```typescript
 {
   name: 'researcher',
@@ -238,6 +243,30 @@ Optional host-side implementation of the MCP Live protocol. External servers (ga
   }],
 }
 ```
+
+#### Event coalescing (RFC-006)
+
+The host advertises `eventCoalescing` (both lanes, deferred rendering,
+channel-scoped pushes, a one-hour retry window). A server may add
+`coalesce: { key }` to a `push/event` or a `channels/incoming` message so that a
+later occurrence of the same subject **replaces** the earlier one while it is
+still unread, and **appends** once a model has seen it; `retract: true`
+withdraws unread content and appends the supplied deletion notice only when
+some version was read (or history is unknown). `initial: true` on a create lets
+the host know the subject's history is complete, so a create → edit → delete
+that nobody read leaves no trace. `deferred: true` (push only) holds a batch of
+notices outside context and asks the server for the content with `push/render`
+when a turn is assembled.
+
+Plain content stays in context and is delivered on arrival through the ordinary
+channel/push path; the host only remembers where it landed. "Unread" means:
+above the agent's consumed watermark (advanced at every compile of a model
+request), on the current branch, not a sharded message, and not folded into a
+summary by compression. On any doubt — restart, branch switch, eviction — the
+host appends, as it does today. There is no per-subject cap: a busy channel's
+unread backlog is simply its unread backlog. Receipts and subject history are
+kept in the `mcpl/coalescing` state (retry window 1 h); audit lines are
+`mcpl:coalescing` trace events.
 
 ### Streaming Lifecycle
 
