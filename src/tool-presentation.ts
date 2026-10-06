@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { fchmodSync, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { ToolDefinition, ToolResult } from './types/events.js';
 
 export interface ToolPresentationConfig {
@@ -110,7 +110,7 @@ export class ToolPresentation {
   }
   edit(tool: string, input: unknown, available: ToolDefinition[]): ToolResult {
     const lock = this.config.path + '.lock';
-    let fd: number | undefined, temp: string | undefined;
+    let fd: number | undefined, tempFd: number | undefined, temp: string | undefined;
     try {
       if (!isPresentationTool(tool)) throw new Error('Unknown editing tool');
       const value = input as Record<string, unknown>;
@@ -133,13 +133,17 @@ export class ToolPresentation {
       parsePresentation(next);
       if (Buffer.byteLength(next)>MAX_BYTES) throw new Error('Presentation exceeds 256 KiB');
       temp = this.config.path + '.' + randomUUID() + '.tmp';
-      writeFileSync(temp,next,{flag:'wx',mode});
-      chmodSync(temp,mode); // creation modes are filtered by the process umask
+      tempFd = openSync(temp,'wx',0o600);
+      writeFileSync(tempFd,next);
+      fchmodSync(tempFd,mode); // preserve permissions on the opened inode, never a replacement path
       if (this.read() !== before) throw new Error('File changed concurrently; retry after reading it');
+      const opened = fstatSync(tempFd), named = lstatSync(temp);
+      if (!named.isFile() || named.dev !== opened.dev || named.ino !== opened.ino)
+        throw new Error('Temporary file changed concurrently; retry after checking the directory');
       renameSync(temp,this.config.path); temp=undefined;
       return {success:true,data:{name:value.name,[field]:value[field],effective:'next newly compiled request',catalogue:this.config.cataloguePath}};
     } catch (error) { return {success:false,isError:true,error:String(error)}; }
-    finally { if(temp) try{unlinkSync(temp);}catch{} if(fd!==undefined){closeSync(fd);unlinkSync(lock);} }
+    finally { if(tempFd!==undefined) closeSync(tempFd); if(temp) try{unlinkSync(temp);}catch{} if(fd!==undefined){closeSync(fd);unlinkSync(lock);} }
   }
 }
 export function renderCatalogue(snapshot: PresentationSnapshot): string {

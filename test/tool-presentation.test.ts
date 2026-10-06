@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync,writeFileSync,readFileSync,chmodSync,statSync,existsSync} from 'node:fs';
@@ -164,4 +166,57 @@ test('catalogue aliases preserve generated content, ownership and read-only acce
   assert.throws(()=>workspace.registerGeneratedTextFile('alias/tools.md',()=> 'duplicate','resident'),/Duplicate/);
   assert.equal((await workspace.handleToolCall({id:'outside',name:'write',input:{path:'board/../outside',content:'no'}})).success,false);
  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('live compilation captures advertised and compression definitions before context hooks refresh tools',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-refresh-'));
+ const path=join(dir,'tools.json');
+ writeFileSync(path,JSON.stringify({version:1,tools:{hidden:{visible:false}}}));
+ const framework=await AgentFramework.create({storePath:join(dir,'store'),membrane:{} as any,
+  agents:[{name:'ada',model:'test',systemPrompt:'.',toolPresentation:{path,cataloguePath:'board/tools.md'}}],
+  modules:[new WorkspaceModule({mounts:[{name:'board',path:dir,mode:'read-write',watch:'never'}]})]});
+ try {
+  const internal=framework as any, agent=internal.agents.get('ada');
+  const original=[{name:'visible',description:'before',inputSchema:{type:'object'}},{name:'hidden',description:'historical',inputSchema:{type:'object'}}];
+  let current=original;
+  internal.getToolsForAgent=()=>current;
+  internal.moduleRegistry.gatherContext=async()=>{
+   await Promise.resolve();
+   original[0].description='mutated';
+   current=[{name:'replacement',description:'after',inputSchema:{type:'object'}}];
+   return [];
+  };
+  let captured:any[]|undefined;
+  agent.startStreamWithInjections=async(...args:any[])=>{captured??=args;throw new Error('test: stop before provider call');};
+  await internal.startAgentStream(agent);
+  assert.ok(captured,'reached live compiler');
+  assert.deepEqual(captured[0].map((t:any)=>[t.name,t.description]),[['visible','before']]);
+  assert.deepEqual(captured[3].map((t:any)=>[t.name,t.description]),[['visible','before'],['hidden','historical']]);
+ } finally {await framework.stop();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('replaced temporary pathname cannot redirect permission changes',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-temp-race-'));
+ const path=join(dir,'tools.json'), victim=join(dir,'private');
+ const before=JSON.stringify({version:1,tools:{}});
+ writeFileSync(path,before);chmodSync(path,0o664);
+ writeFileSync(victim,'private');chmodSync(victim,0o600);
+ const originalWrite=fs.writeFileSync;
+ let replaced=false;
+ try {
+  fs.writeFileSync=((...args:any[])=>{
+   (originalWrite as any)(...args);
+   const temp=fs.readdirSync(dir).find(name=>name.endsWith('.tmp'));
+   if(temp&&!replaced){replaced=true;fs.unlinkSync(join(dir,temp));fs.symlinkSync(victim,join(dir,temp));}
+  }) as typeof fs.writeFileSync;
+  syncBuiltinESMExports();
+  const p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const result=p.edit('set_tool_visibility',{name:'example',visible:false},[{name:'example',description:'example',inputSchema:{type:'object'}}]);
+  assert.equal(replaced,true,'injected replacement after writing');
+  assert.equal(statSync(victim).mode&0o777,0o600,'private target mode unchanged');
+  assert.equal(readFileSync(victim,'utf8'),'private');
+  assert.equal(result.success,false,'detected replacement refuses commit');
+  assert.equal(readFileSync(path,'utf8'),before);
+  assert.deepEqual(fs.readdirSync(dir).sort(),['private','tools.json']);
+ } finally {fs.writeFileSync=originalWrite;syncBuiltinESMExports();rmSync(dir,{recursive:true,force:true});}
 });

@@ -9126,7 +9126,11 @@ export class AgentFramework {
 
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
-      const tools = this.agentToolSurface(agent, requestSnapshot);
+      // Capture both surfaces together before context hooks can refresh tools.
+      const presentation = this.inspectToolPresentation(agent.name, requestSnapshot);
+      const compressionTools = presentation?.available
+        ?? structuredClone(this.availableToolsForPresentation(agent.name, requestSnapshot));
+      const tools = presentation?.advertised ?? compressionTools;
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
       // Both produce ContextInjection[] that get merged before inference.
@@ -9198,7 +9202,7 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
-      } = await agent.startStreamWithInjections(tools, injections, undefined, this.compressionToolsForAgent(agent.name, requestSnapshot));
+      } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools);
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();
