@@ -783,16 +783,18 @@ export class Agent {
   async buildActivationRequest(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools
   ): Promise<NormalizedRequest> {
-    // Keep the context manager's view of the live tool surface current: the
+    // Compression may revisit hidden tools in recorded history. Keep its full
+    // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
     // summarizer/compression requests, or transcripts containing tool blocks
     // are refused by Anthropic's reasoning_extraction classifier (labclaude
     // incident, 2026-07-09). Optional chaining: older context-manager
     // versions don't have the hook.
     (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
-      .setToolDefinitions?.(availableTools);
+      .setToolDefinitions?.(compressionTools);
 
     const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -873,7 +875,8 @@ export class Agent {
   async startStreamWithInjections(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools
   ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
@@ -908,7 +911,7 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget);
+    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools);
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })

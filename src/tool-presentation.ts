@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { ToolDefinition, ToolResult } from './types/events.js';
 
 export interface ToolPresentationConfig {
@@ -100,7 +100,7 @@ export class ToolPresentation {
       const componentDefault = defaults.get(tool.name);
       let description = override?.description ?? componentDefault?.description ?? tool.description;
       const descriptionSource = override?.description !== undefined ? this.config.path : componentDefault?.path ?? "installed component";
-      if (isPresentationTool(tool.name) && override?.description !== undefined)
+      if (isPresentationTool(tool.name) && (override?.description !== undefined || componentDefault !== undefined))
         description += `\nCatalogue: workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}. Changes affect the next newly compiled request.`;
       return {name:tool.name,source:sources.get(tool.name) ?? 'Unattributed',visible:override?.visible ?? true,originalDescription:tool.description,description,descriptionSource,inputSchema:structuredClone(tool.inputSchema)};
     });
@@ -134,6 +134,7 @@ export class ToolPresentation {
       if (Buffer.byteLength(next)>MAX_BYTES) throw new Error('Presentation exceeds 256 KiB');
       temp = this.config.path + '.' + randomUUID() + '.tmp';
       writeFileSync(temp,next,{flag:'wx',mode});
+      chmodSync(temp,mode); // creation modes are filtered by the process umask
       if (this.read() !== before) throw new Error('File changed concurrently; retry after reading it');
       renameSync(temp,this.config.path); temp=undefined;
       return {success:true,data:{name:value.name,[field]:value[field],effective:'next newly compiled request',catalogue:this.config.cataloguePath}};

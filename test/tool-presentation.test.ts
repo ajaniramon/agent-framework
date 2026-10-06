@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,rmSync,writeFileSync,readFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync,readFileSync,chmodSync,statSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ToolPresentation,presentationTools,renderCatalogue} from '../src/tool-presentation.js';
@@ -49,7 +49,32 @@ test('framework preview, generated workspace read and both edit dispatch paths a
   const call=(name:string,input:unknown)=>framework.executeToolCall({id:'test' as any,name,input:input as any,callerAgentName:'ada'});
   assert.equal((await call('set_tool_visibility',{name:target,visible:false})).success,true);
   const snapshot=framework.inspectToolPresentation('ada')!;
+  const agent=(framework as any).agents.get('ada');
+  const cm=agent.getContextManager();
+  const setDefinitions=cm.setToolDefinitions.bind(cm);
+  let compressionTools:any[]=[];
+  cm.setToolDefinitions=(definitions:any[])=>{compressionTools=definitions;setDefinitions(definitions);};
   const preview=await framework.previewActivation('ada');
+  assert.ok(compressionTools.some(t=>t.name===target),'preview retains hidden historical definitions for compression');
+  const ready=cm.isReady;cm.isReady=()=>true;
+  try {compressionTools=[];await (framework as any).runQueuedMaintenance();}
+  finally {cm.isReady=ready;}
+  assert.ok(compressionTools.some(t=>t.name===target),'maintenance retains hidden historical definitions');
+  assert.ok(!(framework as any).agentToolSurface(agent).some((t:any)=>t.name===target),'RFC-008 listing follows advertised visibility');
+  // The live streaming compiler must not overwrite the compression surface
+  // with visible-only definitions after a preview/maintenance refresh.
+  const membrane=agent.membrane;
+  agent.membrane={streamYielding:(request:any)=>{
+    assert.ok(!request.tools.some((t:any)=>t.name===target));
+    return {cancel(){}};
+  }};
+  try {
+    compressionTools=[];
+    await agent.startStreamWithInjections(snapshot.advertised,undefined,undefined,snapshot.available);
+    assert.ok(compressionTools.some(t=>t.name===target),'live stream retains hidden definitions for compression');
+  } finally {agent.cancelStream();agent.membrane=membrane;}
+
+
   assert.deepEqual(preview.tools,snapshot.advertised);
   assert.ok((framework as any).getToolsForAgent('ada').some((t:any)=>t.name===target),'execution surface unchanged');
   assert.ok(!(await framework.previewActivation('other')).tools?.some(t=>t.name==='set_tool_visibility'));
@@ -108,5 +133,35 @@ test('catalogue source groups and line references follow the live snapshot',()=>
    assert.ok(lines.slice(start,start+count).some(l=>l.startsWith('Schema:')));
   }
   assert.ok(!renderCatalogue(p.resolve([tools[1]],sources)).includes('### MCPL server: web'));
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('edits preserve group-write permissions even under a restrictive umask',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-mode-'));
+ const originalMask=process.umask(0o077);
+ try {
+  const path=join(dir,'tools.json');writeFileSync(path,'{"version":1,"tools":{}}');chmodSync(path,0o664);
+  const p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  assert.equal(p.edit('set_tool_visibility',{name:'example',visible:false},[{name:'example',description:'original',inputSchema:{type:'object'}}]).success,true);
+  assert.equal(statSync(path).mode & 0o777,0o664);
+ } finally {process.umask(originalMask);rmSync(dir,{recursive:true,force:true});}
+});
+
+test('catalogue aliases preserve generated content, ownership and read-only access',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-alias-'));
+ const workspace=new WorkspaceModule({mounts:[{name:'board',path:dir,mode:'read-write',watch:'never',autoMaterialize:true},{name:'alias',path:dir,mode:'read-write',watch:'never',autoMaterialize:true}]});
+ try {
+  workspace.registerGeneratedTextFile('board/tools.md',()=> 'generated catalogue','resident');
+  for(const path of ['board/tools.md','board/./tools.md','board/sub/../tools.md','alias/tools.md']) {
+   const call=(name:string,callerAgentName='resident')=>workspace.handleToolCall({id:'alias',name,callerAgentName,input:{path,content:'overwrite',oldString:'generated',newString:'bad'}});
+   const read=await call('read');assert.equal(read.success,true,read.error);assert.match(JSON.stringify(read.data),/generated catalogue/);
+   assert.equal((await call('read','other')).success,false);
+   for(const name of ['write','edit','delete','materialize','sync'])assert.equal((await call(name)).success,false,name+' '+path);
+  }
+  assert.equal((await workspace.handleToolCall({id:'absolute',name:'read',callerAgentName:'resident',input:{path:'board//tools.md'}})).success,false);
+  assert.equal(existsSync(join(dir,'tools.md')),false);
+  assert.throws(()=>workspace.registerGeneratedTextFile('alias/tools.md',()=> 'duplicate','resident'),/Duplicate/);
+  assert.equal((await workspace.handleToolCall({id:'outside',name:'write',input:{path:'board/../outside',content:'no'}})).success,false);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });

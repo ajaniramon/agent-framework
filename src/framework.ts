@@ -2219,7 +2219,7 @@ export class AgentFramework {
         console.error(`[tool-result-guard] agent=${agent.name} storage retry failed during maintenance:`, error);
       }
       const cm = agent.getContextManager();
-      const tools = this.advertisedToolsForAgent(agent.name);
+      const tools = this.compressionToolsForAgent(agent.name);
       cm.setToolDefinitions(tools);
       if (this.providerGateBlocked(agent.name)) return [];
       if (cm.isReady()) return [];
@@ -2776,6 +2776,12 @@ export class AgentFramework {
 
   private advertisedToolsForAgent(agentName: string, snapshot?: InferenceToolSnapshot) {
     return this.inspectToolPresentation(agentName, snapshot)?.advertised
+      ?? this.availableToolsForPresentation(agentName, snapshot);
+  }
+
+  /** Compression can revisit calls to hidden tools; never apply visibility here. */
+  private compressionToolsForAgent(agentName: string, snapshot?: InferenceToolSnapshot) {
+    return this.inspectToolPresentation(agentName, snapshot)?.available
       ?? this.availableToolsForPresentation(agentName, snapshot);
   }
 
@@ -3630,7 +3636,7 @@ export class AgentFramework {
     // Default: no dynamic injection gathering → fully transparent (no
     // inference, no Chronicle writes, no external RPC). Opt in explicitly.
     if (!opts?.injections) {
-      return capture(await agent.buildActivationRequest(tools, undefined, opts?.budget));
+      return capture(await agent.buildActivationRequest(tools, undefined, opts?.budget, presentation?.available ?? tools));
     }
 
     // Full-fidelity path: mirrors startAgentStream's injection gathering.
@@ -3665,7 +3671,7 @@ export class AgentFramework {
       }
     }
 
-    return capture(await agent.buildActivationRequest(tools, injections, opts?.budget));
+    return capture(await agent.buildActivationRequest(tools, injections, opts?.budget, presentation?.available ?? tools));
   }
 
   /**
@@ -9192,7 +9198,7 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
-      } = await agent.startStreamWithInjections(tools, injections);
+      } = await agent.startStreamWithInjections(tools, injections, undefined, this.compressionToolsForAgent(agent.name, requestSnapshot));
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();

@@ -1077,19 +1077,40 @@ export class WorkspaceModule implements Module {
 
   private generatedTextFiles = new Map<string, {read: () => string; agentName: string}>();
 
+  /** Compare the same normalized physical path for registration and tool access. */
+  private generatedFileKey(path: string): string {
+    const slash = path.indexOf('/');
+    const mountName = slash < 0 ? path : path.slice(0, slash);
+    const mount = this.config.mounts.find(m => m.name === mountName);
+    if (!mount) throw new Error(`Unknown mount: "${mountName}"`);
+    const resolved = resolve(mount.path, slash < 0 ? '' : path.slice(slash + 1));
+    if (!isContainedPath(mount.path, resolved)) throw new Error(`Path traversal detected: "${path}"`);
+    return resolved;
+  }
+
+  private findGeneratedTextFile(path: string) {
+    if (!this.generatedTextFiles.size) return undefined;
+    try { return this.generatedTextFiles.get(this.generatedFileKey(path)); }
+    catch {
+      // Not an alias of a valid generated file. Let the selected tool return
+      // its established validation error (including image-specific errors).
+      return undefined;
+    }
+  }
+
   /** Generated files bypass stored blobs so every read reflects current definitions. */
   registerGeneratedTextFile(path: string, read: () => string, agentName: string): void {
     const [mount, ...parts] = path.split('/');
     if (!this.config.mounts.some(m => m.name === mount) || !parts.length
-      || parts.some(p => !p || p === '.' || p === '..') || this.generatedTextFiles.has(path))
+      || parts.some(p => !p || p === '.' || p === '..') || this.generatedTextFiles.has(this.generatedFileKey(path)))
       throw new Error(`Duplicate/invalid generated path: ${path}`);
-    this.generatedTextFiles.set(path, {read, agentName});
+    this.generatedTextFiles.set(this.generatedFileKey(path), {read, agentName});
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       const input = call.input as Record<string, unknown>;
-      const generated = typeof input?.path === 'string' ? this.generatedTextFiles.get(input.path) : undefined;
+      const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
         if (call.callerAgentName !== generated.agentName) return {success:false,isError:true,error:'Generated file belongs to another agent'};
         if (call.name !== 'read') return {success:false,isError:true,error:'Generated file is read-only; edit the presentation configuration instead'};

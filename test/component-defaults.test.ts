@@ -27,3 +27,17 @@ test('component defaults are scoped, resident edits win, reset reveals default, 
   assert.equal(p.resolve(tools,sources).diagnostics.length,1);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+test('component and resident descriptions both retain catalogue discovery on editing tools',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'component-signpost-'));
+ try {
+  const profile=join(dir,'framework.json'),path=join(dir,'resident.json');
+  const tools=['set_tool_visibility','set_tool_description'].map(name=>({name,description:'installed',inputSchema:{type:'object' as const}}));
+  writeFileSync(profile,JSON.stringify({version:1,tools:Object.fromEntries(tools.map(t=>[t.name,{description:'profile wording'}]))}));
+  const p=new ToolPresentation({path,cataloguePath:'board/recovery.md',defaults:[{source:'Framework',path:profile}]});
+  const sources=new Map(tools.map(t=>[t.name,'Framework']));
+  for(const tool of p.resolve(tools,sources).advertised){assert.match(tool.description,/profile wording/);assert.match(tool.description,/workspace--read.*board\/recovery.md/);}
+  p.edit('set_tool_description',{name:'set_tool_visibility',description:'mine'},tools);
+  const own=p.resolve(tools,sources).advertised[0];assert.match(own.description,/mine/);assert.match(own.description,/workspace--read.*board\/recovery.md/);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
